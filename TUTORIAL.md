@@ -1,4 +1,4 @@
-# NeuroSploit — Tutorial & User Guide (v4.0.0)
+# NeuroSploit — Tutorial & User Guide (v4.1.0)
 
 A complete, hands-on guide to installing, configuring and running NeuroSploit —
 the autonomous, multi-model penetration-testing harness.
@@ -22,15 +22,17 @@ the autonomous, multi-model penetration-testing harness.
    - [Host / Infra (Linux / Windows / AD)](#54-host--infra-linux--windows--ad)
 6. [The interactive REPL](#6-the-interactive-repl)
 7. [Mission Control TUI](#7-mission-control-tui)
-8. [Credentials (`creds.yaml`)](#8-credentials-credsyaml)
-9. [Steering the tests (focus & instructions)](#9-steering-the-tests)
-10. [Outputs, reports & artifacts](#10-outputs-reports--artifacts)
-11. [Per-project memory & resume](#11-per-project-memory--resume)
-12. [How it decides: POMDP, grounding, chaining](#12-how-it-decides)
-13. [The agent library](#13-the-agent-library)
-14. [Playwright MCP & extra tools](#14-playwright-mcp--extra-tools)
-15. [Tips, tuning & troubleshooting](#15-tips-tuning--troubleshooting)
-16. [Command & flag reference](#16-command--flag-reference)
+8. [Web console](#8-web-console)
+9. [Credentials (`creds.yaml`)](#9-credentials-credsyaml)
+10. [Steering the tests (focus & instructions)](#10-steering-the-tests)
+11. [Outputs, reports & artifacts](#11-outputs-reports--artifacts)
+12. [Per-project memory & resume](#12-per-project-memory--resume)
+13. [How it decides: POMDP, grounding, chaining](#13-how-it-decides)
+14. [The agent library](#14-the-agent-library)
+15. [Playwright MCP & extra tools](#15-playwright-mcp--extra-tools)
+16. [Tips, tuning & troubleshooting](#16-tips-tuning--troubleshooting)
+17. [Assurance & authorization (v4.1.0)](#17-assurance--authorization)
+18. [Command & flag reference](#18-command--flag-reference)
 
 ---
 
@@ -98,7 +100,7 @@ Agents **degrade gracefully**: if `rustscan` is absent they use `nmap`; if neith
 ### Verify
 
 ```bash
-neurosploit --version          # neurosploit 4.0.0
+neurosploit --version          # neurosploit 4.1.0
 neurosploit agents             # {"vulns":241,...,"ai":30,...,"total":430}
 neurosploit models             # all providers & models
 ```
@@ -147,7 +149,7 @@ Install and log into a local agentic CLI, then pass `--subscription`:
 | `anthropic:` | Claude Code (`claude`) | `claude` → `/login` |
 | `openai:` | Codex (`codex`) | codex login |
 | `gemini:` | Gemini (`gemini`) | gemini login |
-| `xai:` | Grok (`grok`) | grok login |
+| `xai:` | Grok (`grok`) — incl. `xai:grok-4.7` | grok login |
 
 ```bash
 neurosploit run http://testphp.vulnweb.com/ --subscription --model anthropic:claude-opus-4-8 --mcp -v
@@ -429,14 +431,137 @@ neurosploit tui http://testphp.vulnweb.com/ --subscription --model anthropic:cla
 
 ---
 
-## 8. Credentials (`creds.yaml`)
+## 8. NeuroSploit as an MCP server
+
+Run NeuroSploit as a Model Context Protocol server and any MCP client (Claude
+Code, Codex, Cursor, ...) can drive it as tools, from inside your normal agent
+session.
+
+```bash
+neurosploit mcp        # speaks MCP over stdio
+```
+
+### Install in Claude Code
+
+```bash
+claude mcp add neurosploit -- neurosploit mcp
+```
+
+Or add it by hand to `~/.claude.json` (or a project `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "neurosploit": { "command": "neurosploit", "args": ["mcp"] }
+  }
+}
+```
+
+### Install in Codex / Cursor / generic MCP client
+
+Point the client at the command `neurosploit mcp` (stdio transport). For Codex,
+add to its MCP config:
+
+```toml
+[mcp_servers.neurosploit]
+command = "neurosploit"
+args = ["mcp"]
+```
+
+### Tools it exposes
+
+| Tool | What it does |
+|---|---|
+| `neurosploit_run` | Launch an engagement (target, mode, model, focus, scope-file, sandbox, typesafe) |
+| `neurosploit_list_runs` | List finished runs |
+| `neurosploit_findings` | Read a run's findings JSON |
+| `neurosploit_report` | Read a run's Markdown report |
+| `neurosploit_rebuild` | Rebuild a run's report (no model calls) |
+| `neurosploit_internal` | Internal / AD attack-graph analysis |
+| `neurosploit_compliance` | Map a run onto PCI-DSS / HIPAA / SOC 2 |
+
+Each tool shells out to the same `neurosploit` binary, so authorization, scope
+and safety are identical to the CLI. The MCP server needs `neurosploit` on
+`PATH` (or use an absolute path in the config) and, for a run, whatever the
+engagement needs (a model API key or `--subscription`).
+
+---
+
+## 8a. Mobile / binary testing
+
+```bash
+neurosploit mobile <app.apk | app.ipa | binary> --subscription --model anthropic:claude-opus-4-8 -v
+```
+
+Analyses a LOCAL artifact with the `mobile` agent set — 12 reverse-engineering
+skills covering static triage, APK/IPA analysis, RASP/anti-tamper mapping,
+root/jailbreak, TLS pinning, anti-debug, obfuscation deobfuscation, integrity
+checks, secret extraction, insecure storage and traffic analysis. Every tool
+runs HEADLESS (Ghidra `analyzeHeadless`, MobSF REST/Docker, Frida, apktool,
+jadx, radare2) and is provisioned on demand. Best run with `--sandbox` (Kali
+container) so the heavy toolchain installs off your host. Findings are proven
+from the artifact itself, non-destructively.
+
+---
+
+## 8b. Web console
+
+A browser UI for the same harness — one `node` process serves the SPA and drives the compiled
+`neurosploit` binary; nothing about the harness logic is reimplemented in the browser.
+
+```bash
+cd neurosploit-rs && cargo build --release   # once
+node web/server.js                            # → http://localhost:4173
+```
+
+Zero npm dependencies (Node ≥18 built-ins only). Override the port with
+`NEUROSPLOIT_WEB_PORT` (or `PORT`).
+
+**The 5-step wizard:**
+
+1. **Asset** — pick black/white/grey-box, host/infra, or AI/LLM, then the target URL or repo
+   path.
+2. **Scope & Auth** — objective, focus, out-of-scope, and a link into the **Auth & Keys** menu
+   (target auth header, named roles for IDOR/BOLA/BFLA, per-provider API keys — kept in the
+   server process's memory only, never written to disk).
+3. **Leads** — the 435-agent board, auto-categorized (Business Logic, Broken Access Control,
+   Injection, LLM Application, Auth & Session, SSRF & Network, Cloud & Infra, …). Toggle a
+   single lead, a whole category, or **Select all / Clear all** (respects the active search
+   filter). Leave everything off to let the harness's own recon-driven selection choose. **+
+   Custom lead** calls the `claude` CLI to generate a real specialist-agent markdown file into
+   `agents_md/vulns/`, pinnable immediately.
+4. **Model & Run** — provider/model picker from the live catalog, API-key vs. subscription
+   toggle, votes / chain-depth / recon intensity.
+5. **Review** — confirm the plan, then **Start Exploitation**.
+
+**What actually runs `run` / `whitebox` / `greybox`:** the wizard's config is turned into a
+scripted **interactive REPL session** (`/target` or `/repo`, `/model`, `/sub`, `/mcp`, `/votes`,
+`/chain`, `/recon`, `/focus`, `/objective`, `/scope-out`, `/creds`, `/only <agents>`, `/run`) —
+the same session described in [§6](#6-the-interactive-repl) — instead of a one-shot CLI
+invocation, because that's the only harness path that keeps reading stdin **while** the
+engagement streams. That's why the live-run view's **Activity log** tab grows a `❭` prompt box:
+type `/status`, `/stop`, `/continue`, or a plain-language instruction and it goes straight into
+the running session. `host` / `aitest` / `skills` engagements stay one-shot (their onboarding
+scope picker is an interactive arrow-key menu that silently skips itself over piped stdin).
+
+**Live run view** — phase/progress over SSE, a findings table, and **Generative Attack Path
+Chaining**: a node/edge graph (root = target, one node per confirmed finding, positioned by
+kill-chain stage, edges from `chains_from`) — click any node or row for the full finding detail,
+including any PoC script written to `pocs/`. A page refresh reattaches to the same live stream
+instead of resetting to the wizard.
+
+Full API reference: [`web/API.md`](web/API.md) · quick start: [`web/README.md`](web/README.md).
+
+---
+
+## 9. Credentials (`creds.yaml`)
 
 One file covers web auth, **multiple roles** (for access-control testing), SSH,
 Windows/AD and **cloud** (AWS/GCP/Azure). Mix only the blocks you need. It's a
 small YAML subset — flat `key: value` plus one-level nested blocks (2-space indent),
 `#` comments, values optionally quoted.
 
-### 8.1 Web auth (single identity)
+### 9.1 Web auth (single identity)
 
 ```yaml
 # --- pick one ---
@@ -459,7 +584,7 @@ login:
 - A `login:` block is **executed** (real HTTP) to capture a live session
   cookie/token; if it fails, agents are told to authenticate themselves.
 
-### 8.2 Multiple identities — access-control testing (IDOR / BOLA / BFLA / privesc)
+### 9.2 Multiple identities — access-control testing (IDOR / BOLA / BFLA / privesc)
 
 Define two or more **named roles**. With ≥2 roles the harness authenticates as
 each and tests **cross-role** access (a low-priv role reaching another user's
@@ -484,7 +609,7 @@ Per role you may use: `jwt` · `header` (raw) · `cookie` · `apikey` · or
 `login` + `username` + `password`. The first role also becomes the default
 session for normal (non-access-control) tests.
 
-### 8.3 Linux host (SSH) & Windows/AD
+### 9.3 Linux host (SSH) & Windows/AD
 
 ```yaml
 ssh:
@@ -505,7 +630,7 @@ windows:
 `ssh:` / `windows:` tell **host-mode** agents how to authenticate (Linux enum /
 privesc, Windows/AD via crackmapexec/impacket/evil-winrm/bloodhound).
 
-### 8.4 Cloud (AWS / GCP / Azure)
+### 9.4 Cloud (AWS / GCP / Azure)
 
 Exports the right env vars so the `aws` / `gcloud` / `az` CLIs authenticate
 automatically (read-only-first, non-destructive):
@@ -529,7 +654,7 @@ azure:                             # service principal (best for automation)
   subscription_id: ...
 ```
 
-### 8.5 Using it
+### 9.5 Using it
 
 ```bash
 neurosploit run https://app.example --creds creds.yaml \
@@ -542,7 +667,7 @@ written elsewhere (inline GCP JSON is copied to a temp file only for the SDK).
 
 ---
 
-## 9. Steering the tests
+## 10. Steering the tests
 
 Tell the harness what to prioritise — it biases both agent **selection** and
 **execution**:
@@ -556,7 +681,7 @@ stack trace with `@file`, `@folder`, or `@file:10-40`.
 
 ---
 
-## 10. Outputs, reports & artifacts
+## 11. Outputs, reports & artifacts
 
 Every run writes a self-contained folder `runs/ns-<ts>-<target>/`:
 
@@ -573,7 +698,7 @@ The CLI prints a severity summary, an ASCII kill-chain, and the token/cost total
 
 ---
 
-## 11. Per-project memory & resume
+## 12. Per-project memory & resume
 
 When you launch the REPL in a project directory, NeuroSploit creates
 `<cwd>/.neurosploit/`:
@@ -593,7 +718,7 @@ No database needed — it's structured state.
 
 ---
 
-## 12. How it decides
+## 13. How it decides
 
 NeuroSploit treats the target as **partially observable** (a POMDP):
 
@@ -616,7 +741,7 @@ built from SAST/dataflow), so uncertainty becomes *path reachability*, not state
 
 ---
 
-## 13. The agent library
+## 14. The agent library
 
 `agents_md/` holds **430** markdown agents in categories:
 
@@ -636,7 +761,7 @@ the matching folder — it's picked up automatically.
 
 ---
 
-## 14. Playwright MCP & extra tools
+## 15. Playwright MCP & extra tools
 
 `--mcp` (subscription path) drives a real **Playwright** browser for JS-heavy pages
 and to *prove* client-side issues (XSS firing, DOM, screenshots). It's
@@ -646,7 +771,7 @@ back to `curl`. You can add more MCP servers by placing a `mcp.servers.json`
 
 ---
 
-## 15. Tips, tuning & troubleshooting
+## 16. Tips, tuning & troubleshooting
 
 - **No findings on a live target?** It may be unreachable from your network, or the
   app is genuinely static — the harness refuses to fabricate. Check `recon.md`.
@@ -662,7 +787,111 @@ back to `curl`. You can add more MCP servers by placing a `mcp.servers.json`
 
 ---
 
-## 16. Command & flag reference
+## 17. Assurance & authorization
+
+v4.1.0 adds a layer of controls that make a run **defensible**, not just
+productive. All are enforced in code (not prompt text) and every decision lands
+in the hash-chained audit trail.
+
+### Target authorization gate (default-deny)
+
+Before any recon, the target is checked against the capability grant — protocol,
+host, port, URL prefix. A signed token that does not cover the target **refuses
+the run** and exits non-zero:
+
+```bash
+# mint a grant for one host, then run against a different one → refused
+neurosploit capability issue --scope app.example.com --issuer you --subject op --hours 8
+neurosploit run https://other.example.com --capability-token <tok>
+#   ⛔ DENY_TARGET_OUTSIDE_GRANT — other.example.com is outside the authorized scope
+#   (non-zero exit; nothing was tested; the denial is audited)
+```
+
+Loopback (`localhost`/`127.0.0.1`) is exempt — it is unambiguous.
+
+### Hard scope from a file
+
+```bash
+neurosploit run https://app.example.com --scope-file scope.yaml
+```
+
+```yaml
+# scope.yaml — enforced in code; a capability token still caps it
+hard:    [ app.example.com, "*.staging.example.com", 10.20.30.0/24 ]
+exclude: [ payments.example.com ]
+soft:
+  observe_only: [ cdn.example.com ]
+  allow_destructive_methods: false
+  max_requests_per_minute: 240
+  forbidden_payloads: [ "drop table", "rm -rf /" ]
+  notes: [ "SOW-2026-0142; window 02:00-06:00 UTC" ]
+```
+
+Alt-IP encodings (`0x7f000001`, `2130706433`, `0177.0.0.1`,
+`::ffff:127.0.0.1`) all normalize to dotted-quad, so an exclude can't be dodged
+by re-spelling; redirects to a private/loopback address are refused; a
+DNS-rebinding guard refuses a name that re-resolves to a new internal address.
+
+### Evidence-graded CVSS
+
+The score is computed from the FIRST v3.1 equation, and each impact metric is
+graded against a receipt. SQLi that reached the interpreter but extracted
+nothing scores **demonstrated 0 / potential 9.8** — never a manufactured
+critical. The vector travels with the number in the report.
+
+### Audit anchoring & the assurance bundle
+
+```bash
+neurosploit audit <run> --anchor        # chain + signed anchors: catch truncation/rebuild/forgery
+neurosploit assurance <run>             # P1–P5 in one manifest (authorization/enforcement/evidence/integrity/provenance)
+neurosploit assurance <run> --verify    # re-hash every artifact + check the signature
+```
+
+Set `NEUROSPLOIT_ANCHOR_DIR` to also write anchors to external append-only
+(ideally WORM) storage, and `NEUROSPLOIT_PROVENANCE_KEY` to sign them.
+
+### Tooling: sandbox · proxy · PoC re-validation · compliance
+
+```bash
+--sandbox                              # run agent commands in a Kali container (docker/podman)
+--intercept burp|caido|zap|mitmproxy   # route through a tool …
+--intercept own | own+burp             # … or the harness's own recording interceptor
+--revalidate-poc                       # re-run each PoC; demote what no longer reproduces
+--compliance pci-dss,hipaa,soc2        # map findings onto control requirements in the report
+```
+
+### TypeSafe System One (calibrated confirmation)
+
+```bash
+export TYPESAFE_API_KEY=...            # then:
+neurosploit run https://app --typesafe on     # calibrated adjudication + confirmation loop
+neurosploit run https://app --typesafe off    # the identical pipeline, no TypeSafe (for A/B)
+```
+
+`--typesafe auto` (default) turns it on when the key is set. Choose the engine with `--decision-backend typesafe` (hosted) or `--decision-backend laya` (local, free, downloads the model on first use — evidence never leaves the box; see `tools/laya_shim.py`). It adjudicates each
+finding with a calibrated `{confirmed/needs-review/rejected}` judgment over the
+*evidence*, re-grades CVSS when impact isn't demonstrated, prunes irrelevant
+agents, and runs a code-owned confirmation loop over enumerable classes. It is
+**additive** — a deterministic validator still rules; TypeSafe can only lower
+confidence or flag for review, never resurrect a rejected claim. Run it with
+`--typesafe on` and `--typesafe off` against the same target to measure the
+difference (`meta.json` records which mode ran).
+
+### Internal network / AD & reasoning budget
+
+```bash
+neurosploit internal --graph g.json --scaffold corp.local --from foothold --mermaid
+neurosploit run https://app --budget eco|balanced|aggressive   # ration reasoning; default unlimited
+```
+
+The internal graph models an engagement as `Asset → Exposure → Weakness →
+Credential → Privilege → Movement → Crown Jewel` and answers the question a
+CVSS-sorted list can't: **which single edge, removed, cuts the most paths to the
+crown jewels** (`choke_points`).
+
+---
+
+## 18. Command & flag reference
 
 ```
 neurosploit                       # interactive REPL (resumes per project)

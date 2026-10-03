@@ -20,6 +20,72 @@ pub struct RunOutput {
     pub workdir: String,
     /// Paths to persisted artifacts (recon/exploit/findings/report), if any.
     pub artifacts: Vec<String>,
+    /// Set when the run was refused before it started — a scope/authorization
+    /// denial the caller must surface with a non-zero exit, not a clean "0
+    /// findings". Carries the machine-readable reason code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
+}
+
+/// Build the TypeSafe "state" for a finding — its EVIDENCE, not its prose.
+///
+/// System One judges what it is given; giving it the model's own narrative
+/// would just launder the narrative back as a probability. So the state is the
+/// recorded request/response facts and the structured fields, and nothing the
+/// agent wrote about them.
+fn typesafe_state(f: &Finding) -> serde_json::Value {
+    let ex = |x: &Option<crate::validation::Exchange>| -> serde_json::Value {
+        match x {
+            Some(e) => serde_json::json!({
+                "method": e.method, "url": e.url, "status": e.status,
+                "content_type": e.content_type,
+                "body_snippet": e.body.chars().take(1200).collect::<String>(),
+            }),
+            None => serde_json::Value::Null,
+        }
+    };
+    let evidence = f.evidence_data.as_ref().map(|ev| serde_json::json!({
+        "baseline": ex(&ev.baseline),
+        "attack": ex(&ev.attack),
+        "marker": ev.marker,
+        "marker_observed": ev.marker_observed,
+        "browser_executed": ev.browser_executed,
+        "callback_received": ev.callback_received,
+    })).unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "class": f.cwe,
+        "title": f.title,
+        "endpoint": f.endpoint,
+        "payload": f.payload,
+        "auth_context": f.auth_context,
+        "evidence": evidence,
+    })
+}
+
+/// A run that stopped before it started.
+///
+/// Returned when the egress or the authorization boundary refuses the target.
+/// Deliberately an empty result rather than an error value: the caller reports
+/// it the same way it reports any other run, and an empty findings list is the
+/// honest answer to "what did you find" when nothing was ever tested.
+fn aborted(cfg: &RunConfig) -> RunOutput {
+    aborted_with(cfg, None)
+}
+
+/// As [`aborted`], but records a machine-readable denial code so the CLI can
+/// exit non-zero and the reason is auditable — a refused engagement is a
+/// result the operator must be able to prove, not a silent no-op.
+fn aborted_with(cfg: &RunConfig, denied: Option<String>) -> RunOutput {
+    RunOutput {
+        target: cfg.target.clone(),
+        findings: vec![],
+        agents_ran: vec![],
+        candidates: 0,
+        recon: String::new(),
+        workdir: cfg.workdir.clone().unwrap_or_default(),
+        artifacts: vec![],
+        denied,
+    }
 }
 
 const RECON_SYS: &str = "You are an elite web recon specialist on an AUTHORIZED engagement. Actively fetch the target with your tools and map the REAL attack surface in DEPTH — do not ask for permission, proceed:\n\
@@ -41,18 +107,151 @@ fn operator_directives(cfg: &RunConfig) -> String {
     if let Some(focus) = cfg.instructions.as_deref().filter(|x| !x.trim().is_empty()) {
         s.push_str(&format!("OPERATOR FOCUS — prioritise this: {focus}\n"));
     }
+    // Scope is enforced in code (see `crate::scope`); this block exists so the
+    // agent does not burn a round trip discovering a boundary the guard would
+    // have refused anyway. The prose version alone was never a control.
+    s.push_str(&effective_scope(cfg).prompt_block());
     if let Some(oos) = cfg.out_of_scope.as_deref().filter(|x| !x.trim().is_empty()) {
         s.push_str(&format!(
-            "OUT OF SCOPE — HARD CONSTRAINT, do NOT test, probe, or interact with any of the following; \
-             skip them entirely even if reachable, and never report findings against them: {oos}\n"));
+            "OUT OF SCOPE — additional operator constraints (techniques, flows, data) beyond the host rules above: {oos}\n"));
     }
     if let Some(auth) = cfg.auth.as_deref().filter(|x| !x.trim().is_empty()) {
         s.push_str(&format!("AUTHENTICATION — test as an authenticated user; send this with each request: {auth}\n"));
+    }
+    // What the deterministic engine needs in order to confirm a class. Agents
+    // hold the target *now*; asking for a baseline/attack pair or a marker
+    // after the run is asking for something that no longer exists.
+    if crate::validation::Mode::from_env() != crate::validation::Mode::Off {
+        s.push_str(&crate::validation::evidence_contract());
+        s.push_str(&crate::claims::claim_contract());
+    }
+    let recalled = memory_directives(cfg);
+    if !recalled.is_empty() {
+        s.push_str(&recalled);
     }
     if !s.is_empty() {
         s.push('\n');
     }
     s
+}
+
+/// Where this project's durable state lives. The app already points
+/// `vault_dir` at `<cwd>/.neurosploit/vault`, so its parent is the project
+/// store; a caller that set neither falls back to the run's own workdir, which
+/// keeps a one-off run from writing into an unrelated directory.
+pub(crate) fn proj_store(cfg: &RunConfig) -> PathBuf {
+    if let Some(v) = cfg.vault_dir.as_deref() {
+        if let Some(parent) = Path::new(v).parent() {
+            return parent.to_path_buf();
+        }
+    }
+    cfg.workdir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".neurosploit"))
+}
+
+/// The run id used as provenance in the graph and memory: the workdir basename
+/// (`ns-<ts>-<target>`), which is also what the report and the web console use.
+pub(crate) fn run_id(cfg: &RunConfig) -> String {
+    cfg.workdir
+        .as_deref()
+        .and_then(|d| Path::new(d).file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// The engagement's authorization boundary.
+///
+/// Built from the target unless the operator configured one explicitly, with
+/// `out_of_scope` entries that name a host or network promoted into real
+/// exclusions — until now they were only ever prose in a prompt.
+/// Verify the engagement's capability token, if one was supplied.
+///
+/// Returns the grant and any local scope entries it refused to cover. A token
+/// that does not verify is an error, not a warning: running anyway would mean
+/// acting on an authorization nobody can prove was issued.
+pub fn verify_capability(cfg: &RunConfig) -> Result<Option<crate::capability::Capability>, String> {
+    let Some(token) = cfg.capability.as_deref().filter(|t| !t.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(key) = crate::capability::key_from_env() else {
+        return Err("a capability token was supplied but no verification key is configured — set NEUROSPLOIT_CAPABILITY_KEY or NEUROSPLOIT_CAPABILITY_KEY_FILE. An unverifiable token is not authorization.".into());
+    };
+    crate::capability::Capability::verify(token, &key).map(Some).map_err(|e| e.to_string())
+}
+
+/// The audit trail for this run: one per run directory, plus nothing else —
+/// the chain is per-engagement so a run's trail travels with its evidence.
+pub fn audit_log(cfg: &RunConfig) -> crate::audit::AuditLog {
+    let path = cfg
+        .workdir
+        .as_deref()
+        .map(|d| Path::new(d).join("audit.jsonl"))
+        .unwrap_or_else(|| proj_store(cfg).join("audit.jsonl"));
+    crate::audit::AuditLog::open(path)
+}
+
+/// Id of the grant in force, for the audit records. Empty when the run is
+/// operating on local configuration alone, which is itself worth recording.
+fn capability_id(cfg: &RunConfig) -> String {
+    verify_capability(cfg).ok().flatten().map(|c| c.id).unwrap_or_default()
+}
+
+pub fn effective_scope(cfg: &RunConfig) -> crate::scope::ScopePolicy {
+    let mut p = if cfg.scope.hard.is_empty() {
+        crate::scope::ScopePolicy::for_target(&cfg.target)
+    } else {
+        cfg.scope.clone()
+    };
+    if let Some(repo) = cfg.repo.as_deref().filter(|r| r.starts_with("http")) {
+        // A grey-box source repo is fetched, not attacked; authorize the fetch.
+        p.allow(&crate::scope::host_of(repo));
+    }
+    if let Some(oos) = cfg.out_of_scope.as_deref() {
+        for tok in oos.split([',', ';', '\n']) {
+            let t = tok.trim();
+            // Only host-shaped exclusions become rules; a sentence like "no
+            // destructive tests" is guidance for the prompt, not a pattern.
+            if !t.is_empty() && !t.contains(' ') && (t.contains('.') || t.contains('/')) {
+                p.deny(t);
+            }
+        }
+    }
+    // A verified grant is the ceiling. Anything the operator configured that
+    // the grant does not cover is dropped here rather than at request time —
+    // the boundary should be wrong-proof before the first packet, not enforced
+    // after an agent has already decided to go somewhere.
+    if let Ok(Some(cap)) = verify_capability(cfg) {
+        let (constrained, _dropped) = cap.constrain(&p);
+        return constrained;
+    }
+    p
+}
+
+/// Prior knowledge about this target, injected into recon/exploit prompts.
+///
+/// An engagement is usually not the first look at a host, but every model call
+/// starts blank — without this the harness re-derives the same stack, the same
+/// endpoints and the same dead ends on every run. Recall is scored and capped
+/// (see [`crate::memory`]) so the block stays a handful of lines, and it is
+/// explicitly framed as leads to verify: prior belief must not become an
+/// assertion the model is willing to report.
+fn memory_directives(cfg: &RunConfig) -> String {
+    let dir = proj_store(cfg).join("memory");
+    let q = crate::memory::Query {
+        text: format!(
+            "{} {} {}",
+            cfg.target,
+            cfg.objective.clone().unwrap_or_default(),
+            cfg.instructions.clone().unwrap_or_default()
+        ),
+        target: cfg.target.clone(),
+        limit: 6,
+        ..Default::default()
+    };
+    let Ok(mut mem) = crate::memory::shared(&dir).lock() else { return String::new() };
+    mem.prompt_block(&q)
 }
 
 /// Tool-usage doctrine prepended to recon/exploit prompts so the agent knows
@@ -101,6 +300,26 @@ fn tool_doctrine(mcp_on: bool) -> String {
            (`timeout 90 <install> || echo skip`) and try each at most once — if it fails, isn't packaged, has no network \
            or hangs, SKIP it and fall back to curl/nc/dig/python3. A missing or un-downloadable tool is NEVER a reason \
            to stall: move on with what you have.\n\
+         - PICK THE BEST TOOL, DON'T SETTLE FOR THIS LIST: the tools above are a starting menu, not a limit.            You are expected to reason about the CONTEXT and reach for (or install) the strongest tool for THAT job,            the way a real operator does — if a better/more specific tool exists, research it, provision it (see TOOL            DOWNLOAD), and use it. Prefer battle-tested tooling over hand-rolled scripts when it fits.
+         - CONTEXT TOOLBOXES (provision what the detected surface calls for; time-box each install, skip on failure):
+           · Active Directory / Windows / SMB / LDAP / Kerberos: `netexec`(nxc)/`crackmapexec`, the `impacket` suite              (secretsdump, GetUserSPNs, GetNPUsers, ntlmrelayx, psexec/wmiexec/smbexec), `bloodhound-python`/`bloodhound-ce`              + neo4j for the AD graph, `kerbrute`, `certipy` (AD CS/ESC), `ldapdomaindump`, `enum4linux-ng`, `responder`,              `evil-winrm`, `Coercer`/`PetitPotam`, `adidnsdump`. Map credential→identity→permission→machine and feed the              internal attack graph.
+           · Web / API deep recon: `httpx`, `katana`, `gau`, `waybackurls`, `subfinder`/`amass` (only in-scope),              `arjun` (param mining), `nuclei` (targeted), `feroxbuster`/`ffuf`, `jwt_tool`, `graphw00f`/`clairvoyance`              (GraphQL), `trufflehog`/`gitleaks` on exposed repos.
+           · Cloud: `pacu`, `scoutsuite`, `prowler`, `trivy`, the provider CLIs (`aws`/`gcloud`/`az`), `cloud_enum`.
+           · Exploitation frameworks: `metasploit`/`msfconsole` and `msfvenom` for payloads/PoCs, `sqlmap` for deep SQLi,              `commix` for command injection — use surgically, non-destructively, never a blind auto-exploit.
+           · Secrets/creds & cracking (offline, on captured material only): `hashcat`/`john`, `trufflehog`.
+           · Mobile (APK/IPA): `mobsf` (run HEADLESS via its Docker image / REST API, not the GUI), `apktool`, `jadx`, \
+             `apkleaks`, `objection`/`frida`; `nuclei` on discovered endpoints.\n\
+           · Reverse engineering / binaries: `ghidra` HEADLESS (`analyzeHeadless`), `radare2`/`rizin`, `binwalk`, \
+             `checksec`, `gdb`; decompile and triage without any GUI.\n\
+           · Any GUI tool runs HEADLESS: prefer a CLI / REST / `analyzeHeadless` / `--no-gui` mode or the Docker \
+             image; never require an X display. If a tool is GUI-only, drive its API or skip it.\n\
+         - HEAVY TOOLBOX: many of these ship in `kali-linux-large` or install via apt/pipx/go — when running in the Kali            sandbox they are one `apt install`/`pipx install` away; provision on demand for the context at hand.
+         - CVE -> PoC SOURCING (core capability, not a last resort): the moment you fingerprint a concrete version            (WordPress core/plugin/theme, a CMS, framework/library, an OS package, a service banner), find and run a real            proof-of-concept for its known CVEs:
+           · `searchsploit <product> <version>` (Exploit-DB, offline in Kali); `searchsploit -m <id>` copies a PoC              locally, `-x` reads it, `-u` updates the DB.
+           · Search Exploit-DB, GitHub (`github.com/search?q=CVE-XXXX-YYYY`), PacketStorm, Vulners and the GHSA/NVD              advisory for a working PoC; `git clone` the specific repo (pinned) or fetch the single script.
+           · WordPress: `wpscan --url <t> --enumerate vp,vt,u` to pin vulnerable plugins/themes, then pull the PoC.
+           · BUILD when needed: compile C/Go/Rust PoCs (`gcc`/`make`/`go build`/`cargo build`) or install Python/Ruby              deps in the sandbox; READ the exploit first, adapt hardcoded targets/ports to THIS engagement, run it              non-destructively (benign marker/`id`/OOB callback as proof, never a destructive payload).
+           · Vet everything: reputable source, pinned version, read before running, time-box each fetch/build; if no PoC              exists or it will not build, fall back to a manual attempt or report the version as a lead. This is how you              exploit CVEs that have a public PoC.
          - {browser}\n\
          - {ua}{proxy}{pocs}\
          Use only what is installed; degrade gracefully. Never block on a single tool install. Never run destructive or DoS actions.\n\n",
@@ -181,7 +400,7 @@ fn pocs_line() -> String {
              and the observable proof (response snippet, status code, timing, etc.). Header comment: what it \
              proves, how to run it. Actually RUN it once to confirm it works before citing it. Put the exact file \
              name (e.g. `pocs/idor_order_id.py`) in the finding's `evidence` field so the report and UI can link \
-             it — a finding without a cited PoC path looks unproven.\n         "),
+             it — a finding without a cited PoC path looks unproven. SAVE EVERY exploitation artifact you write              into {d}/ so it can be retrieved after the run: repro scripts, Frida hook scripts (`{d}/<slug>.frida.js`),              custom exploit code (any language), the compiled binary or its source, request collections, and any              downloaded-and-adapted public PoC. Keep the exact command to run each in its header comment.\n         "),
         None => String::new(),
     }
 }
@@ -209,15 +428,26 @@ many registrations, report it as a LEAD and STOP rather than mass-creating accou
 fn engagement_ops(cfg: &RunConfig) -> String {
     let (vault, _) = vault_paths(cfg);
     let temp = if cfg.temp_email {
+        match std::env::var("NEUROSPLOIT_TEMP_INBOX").ok().filter(|a| !a.trim().is_empty()) {
+            // The harness already created a disposable inbox (see crate::inbox);
+            // hand the agent that exact address so the inbox is one the harness
+            // owns (for cleanup and audit) rather than an unrecorded one.
+            Some(addr) => Box::leak(format!(
+                "DISPOSABLE EMAIL (enabled): the harness created inbox `{addr}` for you (mail.tm). USE THIS ADDRESS as the                  account email. Read confirmation codes/links by polling `GET https://api.mail.tm/messages` — the harness                  also polls it and records what arrives.", ).into_boxed_str()) as &str,
+            None =>
         "DISPOSABLE EMAIL (enabled): if registration requires an email confirmation code/link, you MAY use the free \
          mail.tm API (no key) — `POST https://api.mail.tm/accounts` {address,password} to create an inbox (get a \
          valid domain from `GET https://api.mail.tm/domains`), `POST https://api.mail.tm/token` for a JWT, then poll \
          `GET https://api.mail.tm/messages` (Bearer JWT) to read the confirmation code/link. Use the mail.tm address \
          as the account email. Guerrilla Mail's API is a fallback. "
+        }
     } else {
         "DISPOSABLE EMAIL (disabled): if registration REQUIRES an email confirmation you cannot receive, stop and \
          report it as a blocker (do not attempt to bypass it). "
     };
+    let oob = oob_ops(cfg);
+    let sms = sms_ops(cfg);
+    let waf = WAF_OPS;
     format!(
         "ENGAGEMENT OPS — TEST ACCOUNTS & VAULT:\n\
          - CREDENTIAL VAULT: whenever you create a test account or generate any credential, APPEND one JSON line to \
@@ -231,8 +461,50 @@ fn engagement_ops(cfg: &RunConfig) -> String {
            or \"unauthenticated\" (proven with no session), and `account` to which user/role you used. In grey-box, be \
            explicit about which findings needed a login. In black-box, record in `how`/evidence exactly what you did \
            to create the user.\n\
-         - {temp}\n\n"
+         - LOGIN VERIFICATION EVIDENCE: when you authenticate (register or use given creds), CAPTURE proof the login            actually worked BEFORE deep testing — save the login request/response pair to the evidence, a Playwright            screenshot of the post-login page to $NEUROSPLOIT_POCS/../evidence/login-<role>.png, and record in the            finding/vault whether login SUCCEEDED or FAILED and why. A pentest run should be able to show it was logged            in (or explain why it could not) before claiming authenticated findings.
+         - HTTP TRAFFIC: the harness archives every request/response the replay layer makes; when you prove a finding,            keep the exact request AND response in its `evidence` so the report can show the raw exchange behind it.
+         - {temp}\n\
+         {oob}{sms}{waf}\n"
     )
+}
+
+/// The out-of-band channel's instructions, when one is configured.
+///
+/// Blind classes are the ones agents most often assert and least often prove.
+/// Handing them a domain we control turns "the parameter might be fetched
+/// server-side" into a callback with a source address on it — and the
+/// instruction is explicit that a DNS query alone is the weaker claim, because
+/// that is the overclaim this channel otherwise invites.
+fn oob_ops(cfg: &RunConfig) -> String {
+    let Some(domain) = cfg.oob_domain.as_deref().filter(|d| d.contains('.')) else {
+        return "- OUT-OF-BAND (not configured): you cannot prove blind SSRF/XXE/RCE. Report such a candidate as a LEAD                 with the evidence you do have — never as a confirmed finding.\n"
+            .to_string();
+    };
+    let token = crate::provenance::Provenance::process().marker("oob").to_lowercase();
+    format!(
+        "- OUT-OF-BAND CHANNEL (enabled): a listener answers for *.{domain}. Build payload hostnames as          `<token>.{domain}` where <token> starts with `{token_prefix}` — use a DIFFERENT token per probe so a          callback is attributable to one payload (example: `{token}`). Report the token you used in the finding's          `payload` field and the callback details in `evidence`. An HTTP callback proves the target connected out;          a DNS query alone proves only that a resolver saw the name — say which one you observed, and never write          'the server fetched my URL' on the strength of a DNS query.\n",
+        token_prefix = crate::provenance::SIGIL.to_lowercase()
+    )
+}
+
+/// What an agent must do when the edge answers instead of the application.
+///
+/// Both failure directions are named explicitly, because agents make both: a
+/// 403 from a WAF read as "not vulnerable" (the expensive one), and a block
+/// page echoing the payload read as reflection (the embarrassing one).
+const WAF_OPS: &str = "- WAF / EDGE: if a response came from a CDN or WAF rather than the application (vendor headers plus block-page      wording, a challenge, or HTTP 429), the application NEVER SAW your request. Never record that as 'tested, not      vulnerable' — record that the control could not be reached, and say which probes were blocked. A payload echoed      back by a block page is the EDGE reflecting it, not the application: it is not XSS evidence. On a 429 or a browser      challenge, pace the requests and retry — that is not a verdict on the payload.\n";
+
+/// Inbound SMS instructions, when a number is configured.
+fn sms_ops(cfg: &RunConfig) -> String {
+    match cfg.sms.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(spec) => {
+            let number = spec.rsplit(':').next().unwrap_or("");
+            format!(
+                "- INBOUND SMS (enabled): {number} receives messages for OTP and phone-verification flows. For a                  rate-limit claim, count DELIVERED messages carrying DISTINCT codes — not HTTP 200s. An endpoint that                  accepts twenty requests and sends one message is not unthrottled.\n"
+            )
+        }
+        None => String::new(),
+    }
 }
 /// Resolve the vault directory + this run's file stem. Prefer `.neurosploit/vault`
 /// (persistent project store) set by the app; fall back to the run workdir. Returns
@@ -332,7 +604,10 @@ const CHAIN_DOCTRINE: &str = "CHAIN THE FOOTHOLD (pivot to deeper, provable impa
   · XXE → SSRF/file read → creds; deserialization/SSTI → RCE via a gadget/template sink; prove exec with a marker.\n\
   · IDOR/BOLA/mass-assignment → account/tenant takeover or role escalation (`role=admin`); open-redirect/XSS/CORS → token/session theft → ATO.\n\
   · Exposed `.git`/backup/`.env`/secrets → reconstruct source & keys → auth to internal APIs, cloud, DB; default/leaked creds → domain/service compromise.\n\
+  · A param that lands in a redirect/`Location` header → ALSO test CRLF/header injection on the SAME param (`%0d%0aX-Injected: pwned`, `%0d%0aSet-Cookie:`): an open redirect and response splitting share the sink, so never stop at the redirect.\n\
+- Second-order & preconditions: a payload you STORE (profile/bio/name/review/filename) may only fire on a DIFFERENT page, often a privileged one (e.g. an admin search). Plant the payload, then TRIGGER it from every identity you hold; if the trigger page needs a role you lack, FIRST look for a privesc/IDOR/mass-assign to reach it, and if none exists, report the second-order as a CHAINED lead (payload stored + trigger located, blocked only by authorization) rather than dropping it.\n\
 - Reuse loot relentlessly: every credential/JWT/cookie/API key/host you obtain is input to the next step — carry it forward across modules and try it everywhere it might be accepted.\n\
+- Mine object references (this is the BOLA/IDOR engine): from EVERY response harvest each object identifier you see — numeric ids, UUIDs, order/invoice/document/ticket numbers, account/customer ids, filenames, emails, and any signed/opaque token — into a reference pool. Then systematically SUBSTITUTE another principal's identifier into every request that accepts one (path segment, query param, JSON field, header, cookie) and diff the response against your own: another user's data returned under your session IS the proof. Do this ACROSS identities — register/hold ≥2 accounts and cross them — and across endpoints, because an id leaked on one route (a list/search/export) is often the key to an object on another (a detail/update/delete route). Enumerate sequential ids sparingly (a small benign sample, never a mass scrape) to show the pattern, then stop at proof.\n\
 - Understand the BUSINESS & LOGIC: reason about what the app is FOR (payments, orders, tenancy, KYC, entitlements) and chain toward business impact — payment/price/coupon abuse, cross-tenant data access, entitlement/limit bypass, workflow/state-machine skips (skip approval/verification steps), race conditions on balance/stock. These compound: each finding updates your model of the app for the next probe.\n\
 - Stop at proof: demonstrate the impact with the SMALLEST safe step and report the CHAIN end-to-end; never destroy, overwrite, encrypt, mass-exfiltrate, or DoS to 'prove' it.\n\n";
 
@@ -422,9 +697,14 @@ fn identify_asset(p: &crate::probe::Probe) -> String {
 /// generator can name the asset and its stack instead of only the URL.
 fn write_meta(cfg: &RunConfig, p: &crate::probe::Probe, asset: &str) {
     let Some(dir) = cfg.workdir.as_deref() else { return };
+    // Record whether TypeSafe was active, so a with/without pair is measurable
+    // from the artifacts alone.
+    let typesafe_on = std::env::var("NEUROSPLOIT_TYPESAFE").unwrap_or_default().trim().to_lowercase() != "off"
+        && std::env::var("TYPESAFE_API_KEY").map(|k| !k.trim().is_empty()).unwrap_or(false);
     let meta = serde_json::json!({
         "target": cfg.target, "asset": asset, "title": p.title, "brand": p.brand,
         "tech": p.tech, "server": p.server, "status": p.status,
+        "typesafe": typesafe_on,
     });
     if let Ok(j) = serde_json::to_string_pretty(&meta) {
         let _ = std::fs::write(format!("{}/meta.json", dir.trim_end_matches('/')), j);
@@ -434,13 +714,221 @@ fn write_meta(cfg: &RunConfig, p: &crate::probe::Probe, asset: &str) {
 /// Black-box web engagement: recon → parallel exploit → N-model vote → report.
 pub async fn run(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<String>) -> RunOutput {
     pool.set_progress(tx.clone());
+
+    // Authorization first. A supplied token that does not verify ends the run
+    // here: proceeding would mean acting on a grant nobody can prove was
+    // issued, which is the one failure this whole layer exists to prevent.
+    let grant = match verify_capability(&cfg) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = tx.send(format!("notify: ⛔ {e}")).await;
+            audit_log(&cfg).append(
+                crate::audit::AuditRecord::new("harness", "engagement-start", &cfg.target)
+                    .decision(&format!("deny: {e}"))
+                    .tool("capability")
+                    .result("run refused"),
+            );
+            return RunOutput {
+                target: cfg.target.clone(),
+                workdir: cfg.workdir.clone().unwrap_or_default(),
+                findings: vec![],
+                agents_ran: vec![],
+                candidates: 0,
+                recon: String::new(),
+                artifacts: vec![],
+                denied: None,
+            };
+        }
+    };
+    let audit = audit_log(&cfg);
+    let cap_id = grant.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+    let policy_scope = effective_scope(&cfg);
+    audit.append(
+        crate::audit::AuditRecord::new("harness", "engagement-start", &cfg.target)
+            .decision(&format!("allow: scope [{}]", policy_scope.summary()))
+            .tool("neurosploit")
+            .capability(&cap_id)
+            .result(&format!(
+                "{} · {}",
+                grant.as_ref().map(|c| c.summary()).unwrap_or_else(|| "no capability token — local configuration only".into()),
+                cfg.policy.safety.summary()
+            )),
+    );
+    if let Some(c) = &grant {
+        let _ = tx.send(format!("notify: 🔏 capability verified — {}", c.summary())).await;
+    }
+    // Bind the process to this engagement before the first prompt or marker is
+    // minted, so everything the run emits agrees on which run it came from.
+    let prov = crate::provenance::Provenance::bind_run(&run_id(&cfg));
+    let _ = tx.send(format!("notify: 🧬 provenance {} (build {})", prov.tag(), prov.build)).await;
+
+    // P1 — target authorization gate, default-deny, BEFORE any reconnaissance.
+    // A capability token that does not cover the target is the exact bypass
+    // this closes: the run refuses the target instead of quietly seeding it
+    // into scope. Legacy (no token) still authorizes a bare target.
+    {
+        let has_grant = matches!(verify_capability(&cfg), Ok(Some(_)));
+        let escope = effective_scope(&cfg);
+        if let Err(reason) = escope.validate_target(&cfg.target, has_grant) {
+            let _ = tx.send(format!("notify: ⛔ DENY_TARGET_OUTSIDE_GRANT — {reason}")).await;
+            let audit = audit_log(&cfg);
+            audit.append(
+                crate::audit::AuditRecord::new("scope-guard", "deny-target-outside-grant", &cfg.target)
+                    .decision(&format!("DENY_TARGET_OUTSIDE_GRANT: {reason}"))
+                    .tool("scope-guard")
+                    .result("run refused before reconnaissance"),
+            );
+            return aborted_with(&cfg, Some(format!("DENY_TARGET_OUTSIDE_GRANT: {reason}")));
+        }
+    }
+
+    // Egress, fail-closed. An internal target with the VPN down belongs to
+    // whatever network this host is on — not the client's — so the run stops
+    // here rather than producing a confident report about the wrong machines.
+    let transport = match cfg.transport.as_deref() {
+        Some(spec) => match crate::transport::Egress::parse(spec) {
+            Ok(e) => crate::transport::Transport::new(e),
+            Err(e) => {
+                let _ = tx.send(format!("notify: ✗ transport: {e}")).await;
+                return aborted(&cfg);
+            }
+        },
+        None => crate::transport::Transport::direct(),
+    };
+    if let Err(e) = transport.admits(&cfg.target) {
+        let _ = tx.send(format!("notify: ⛔ {e}")).await;
+        return aborted(&cfg);
+    }
+    if !matches!(transport.egress, crate::transport::Egress::Direct) {
+        match transport.connect().await {
+            Ok(label) => {
+                let _ = tx.send(format!("notify: 🔌 egress via {label}")).await;
+                match transport.verify(None).await {
+                    Ok(ip) => {
+                        let _ = tx.send(format!("notify: egress address {ip}")).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("notify: ⛔ {e}")).await;
+                        return aborted(&cfg);
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(format!("notify: ⛔ transport failed to come up: {e}")).await;
+                return aborted(&cfg);
+            }
+        }
+    }
+
+    // Disposable inbox: when temp-email is enabled, the HARNESS creates the
+    // mail.tm inbox (via crate::inbox) and hands the agent that exact address,
+    // so the inbox is one we own — recorded, pollable, cleanup-able — instead
+    // of an unrecorded one the agent conjures. Best-effort; on failure the
+    // prompt falls back to letting the agent create its own.
+    if cfg.temp_email && std::env::var("NEUROSPLOIT_TEMP_INBOX").map(|v| v.is_empty()).unwrap_or(true) {
+        match crate::inbox::Inbox::mail_tm().await {
+            Ok(inbox) => {
+                let addr = inbox.identity();
+                std::env::set_var("NEUROSPLOIT_TEMP_INBOX", &addr);
+                let _ = tx.send(format!("notify: 📬 disposable inbox ready — {addr}")).await;
+            }
+            Err(e) => {
+                let _ = tx.send(format!("notify: ⚠ could not create a disposable inbox ({e}) — agent will create its own")).await;
+            }
+        }
+    }
+
+    // Out-of-band channel. Optional, but without it the blind classes can only
+    // ever be leads — which the prompt says explicitly rather than letting an
+    // agent assert a callback it had no way to receive.
+    if let Some(domain) = cfg.oob_domain.as_deref().filter(|d| d.contains('.')) {
+        let http: std::net::SocketAddr = cfg
+            .oob_http
+            .as_deref()
+            .unwrap_or("0.0.0.0:8080")
+            .parse()
+            .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
+        let dns = cfg.oob_dns.as_deref().and_then(|d| d.parse().ok());
+        let collab = crate::oob::Collaborator::self_hosted(domain, http, dns);
+        match collab.listen().await {
+            Ok(()) => {
+                let note = collab.preflight().await.unwrap_or_else(|e| e);
+                let _ = tx.send(format!("notify: 📡 {note}")).await;
+            }
+            Err(e) => {
+                // A listener that did not bind would turn every blind class
+                // into a silent false negative, so say so loudly and carry on
+                // with the channel marked unavailable.
+                let _ = tx.send(format!("notify: ⚠ OOB listener did not start ({e}) — blind classes stay leads")).await;
+            }
+        }
+    }
+
+    // Intercepting proxy. Whether it is Burp, an own recording interceptor, or
+    // both, the effect is one env var the reqwest client already honours, plus
+    // the same var exported to agent child commands — so the whole engagement
+    // flows through one point the operator can watch and replay.
+    if let Some(spec) = cfg.intercept.as_deref().filter(|s| !s.trim().is_empty()) {
+        match crate::proxy::ProxyConfig::parse(spec) {
+            Ok(pc) => {
+                if pc.own_interceptor {
+                    let jsonl = cfg.workdir.as_deref().map(|d| format!("{}/flows.jsonl", d.trim_end_matches('/')));
+                    let upstream = pc.upstream.as_ref().map(|t| t.proxy_url());
+                    let mut interceptor = crate::proxy::Interceptor::new(upstream);
+                    if let Some(j) = jsonl { interceptor = interceptor.logging_to(j); }
+                    match interceptor.listen(pc.bind).await {
+                        Ok(()) => { let _ = tx.send(format!("notify: 🕵 {}", pc.summary())).await; }
+                        Err(e) => { let _ = tx.send(format!("notify: ⚠ own interceptor did not bind ({e}) — routing direct")).await; }
+                    }
+                } else if let Some(t) = &pc.upstream {
+                    // A bare tool: warn if it is not actually listening rather
+                    // than failing every request three minutes in.
+                    if !t.is_listening().await {
+                        let _ = tx.send(format!("notify: ⚠ {} is configured but nothing is listening at {} — start it or requests will fail", t.name(), t.proxy_url())).await;
+                    } else {
+                        let _ = tx.send(format!("notify: 🕵 {}", pc.summary())).await;
+                    }
+                }
+                if let Some(url) = pc.client_proxy_url() {
+                    // The reqwest client (probe + replay) reads this; child
+                    // commands get it through the process environment.
+                    std::env::set_var("NEUROSPLOIT_PROXY", &url);
+                    for (k, v) in pc.env() { std::env::set_var(k, v); }
+                }
+            }
+            Err(e) => { let _ = tx.send(format!("notify: ⚠ intercept: {e} — routing direct")).await; }
+        }
+    }
+
+    // Sandbox: run the engagement's tool commands inside a container instead of
+    // on the host. Ensured up-front so a missing runtime is reported before any
+    // work, and never silently downgraded to host execution.
+    if let Some(image) = cfg.sandbox.as_deref() {
+        let mut sc = crate::sandbox::SandboxConfig::default();
+        if !image.trim().is_empty() { sc = sc.with_image(image); }
+        if let Some(w) = cfg.workdir.as_deref() { sc = sc.mounting(w); }
+        let proxy_env: Vec<(String,String)> = std::env::var("NEUROSPLOIT_PROXY").ok()
+            .filter(|v| !v.is_empty())
+            .map(|p| vec![("HTTP_PROXY".into(), p.clone()), ("HTTPS_PROXY".into(), p)])
+            .unwrap_or_default();
+        sc = sc.with_env(proxy_env);
+        match crate::sandbox::Sandbox::new(sc) {
+            Ok(sb) => match sb.ensure().await {
+                Ok(msg) => { let _ = tx.send(format!("notify: 📦 {msg}")).await; }
+                Err(e) => { let _ = tx.send(format!("notify: ⚠ sandbox: {e}")).await; }
+            },
+            Err(e) => { let _ = tx.send(format!("notify: ⚠ {e}")).await; }
+        }
+    }
+
     let _ = tx
         .send(format!(
-            "Loaded {} agents ({} vuln / {} recon / {} code / {} meta) · models: {} · vote_n={} · concurrency={}{}",
+            "Loaded {} agents ({} vuln / {} recon / {} code / {} meta) · models: {} · vote_n={} · concurrency={}{} · budget: {}",
             lib.total(), lib.vulns.len(), lib.recon.len(), lib.code.len(), lib.meta.len(),
             pool.candidates.iter().map(|m| m.label()).collect::<Vec<_>>().join(", "),
-            cfg.vote_n, cfg.concurrency,
+            effective_vote_n(&cfg), cfg.concurrency,
             if pool.mcp_config.is_some() { " · Playwright MCP ON" } else { "" },
+            cfg.budget.summary(),
         ))
         .await;
 
@@ -450,7 +938,7 @@ pub async fn run(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<Str
     let probe_facts = if cfg.offline {
         String::new()
     } else {
-        let p = crate::probe::probe(&cfg.target).await;
+        let p = crate::probe::probe_in_scope(&cfg.target, &effective_scope(&cfg)).await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
         // Liveness preflight: if the target never answered (connect failed /
         // status 0), don't waste agents on a dead host — abort with a clear note.
@@ -459,7 +947,7 @@ pub async fn run(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<Str
                 .unwrap_or_else(|| "no HTTP response".into());
             let _ = tx.send(format!("✗ target unreachable — {} is DOWN ({why}). Aborting; check the URL/port or that the service is up.", cfg.target)).await;
             let artifacts = persist(&cfg, "{}", "", &[]);
-            return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![], agents_ran: vec![], candidates: 0, recon: String::new(), artifacts };
+            return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![], agents_ran: vec![], candidates: 0, recon: String::new(), artifacts, denied: None };
         }
         // Identify the ASSET (product + stack), not just the URL, for the report.
         let asset = identify_asset(&p);
@@ -485,8 +973,14 @@ pub async fn run(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<Str
         let selected: Vec<Agent> = ranked.into_iter().take(cap).collect();
         let _ = tx.send(format!("selected {} specialist agents (RL-ranked)", selected.len())).await;
         let _ = tx.send("offline: no exploitation performed (provide API keys or --subscription to run live)".into()).await;
+        // Recon still learned something about the target even with no
+        // exploitation, and that is exactly the kind of knowledge the next run
+        // should not have to re-derive.
+        for n in absorb(&cfg, &recon, &[]) {
+            let _ = tx.send(n).await;
+        }
         let artifacts = persist(&cfg, &recon, "", &[]);
-        return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![], agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon, artifacts };
+        return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![], agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon, artifacts, denied: None };
     }
 
     // Use the model to pick the agents whose preconditions match the recon —
@@ -584,8 +1078,21 @@ pub async fn run(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<Str
                     "AUTHORIZED engagement — you have explicit permission to test {target}. \
                      Do not ask for confirmation — proceed and PROVE each issue.\n\n\
                      {directives}{react}{depth}{decision}{spa}{safety}{ops}{doctrine}{shots}{body}\n\nWhen done, reply with ONLY a JSON array of confirmed findings (may be empty []). \
-                     Each item: {{id,title,severity,cwe,endpoint,payload,evidence,impact,remediation,confidence,auth_context,account,secret,screenshots}}. \
-                     `evidence` must contain the concrete proof (request/response excerpt). \
+                     Each item: {{id,title,severity,cwe,endpoint,location,payload,evidence,repro_steps,impact,remediation,confidence,auth_context,account,secret,screenshots}}. \
+                     Write for a developer who has never seen this app and has to fix it today:\n\
+                     - `location`: EXACTLY where it is — the parameter, form field, header, JSON key, or flow step (e.g. \"POST /api/orders, JSON field `role`\"). An endpoint alone sends them hunting.\n\
+                     - `impact`: what an attacker gets, stated as what you MEASURED — not what the class usually enables. If you proved 25 unthrottled requests, say that; do not claim inbox flooding unless you observed mail being sent. An inflated impact gets the whole finding rejected, and the real measurement is lost with it.\n\
+                     - `remediation`: the concrete change, naming the control (parameterised query, server-side authorisation check, allowlist), not \"sanitise input\".\n\
+                     - `repro_steps`: an ORDERED array of literal commands someone can paste one by one from a clean shell — baseline request first, then the attack, then how to read the result. Include the real URL and the real payload.\n\
+                     - `evidence`: the concrete proof (request/response excerpt with status, key headers and the decisive part of the body). \
+                     A PoC script is an EXTRA artifact, never a substitute for these steps.\n\
+                     - `evidence_data`: the artifacts the harness verifies WITHOUT a model. Shape:\n\
+                       {{\"baseline\":{{\"method\":\"GET\",\"url\":\"...\",\"status\":200,\"body\":\"...\",\"headers\":{{\"set-cookie\":\"...\"}},\"request_headers\":{{}},\"elapsed_ms\":120,\"identity\":\"\"}},\n\
+                        \"attack\":{{same shape, the request carrying the payload}},\n\
+                        \"repeats\":[{{same shape, the attack repeated}}],\n\
+                        \"marker\":\"a unique token YOU chose\",\"marker_observed\":true|false,\"browser_executed\":true|false,\"callback_received\":true|false,\n\
+                        \"identity_a\":{{the owner's response}},\"identity_b\":{{another identity requesting the SAME resource}}}}\n\
+                       Fill only what applies to the class (see the evidence contract above); truncate bodies to the decisive part. \
                      `screenshots` is an array of proof-image paths you saved into the evidence dir (see EVIDENCE SCREENSHOTS above); omit or leave empty when you captured none. \
                      Set `auth_context` to \"authenticated\" or \"unauthenticated\"; set `account` to the test user/role you used (if any); \
                      for a created test account set `secret` to its generated password (it is stored in the run vault and masked in the report).",
@@ -602,7 +1109,12 @@ pub async fn run(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<Str
                     Ok((m, text)) => {
                         let f = extract_findings(&text, &ag.name);
                         let _ = txc.send(format!("exploit {} via {} → {} candidate(s)", ag.name, m.label(), f.len())).await;
-                        if f.is_empty() && !text.trim().is_empty() && text.trim() != "[]" {
+                        // "no findings" is a RESULT, not a parse failure. Models
+                        // wrap the empty array in a ```json fence, so comparing the
+                        // raw text to "[]" reported every honest negative as
+                        // malformed — which teaches the operator to ignore a
+                        // warning that sometimes means a real parse failure.
+                        if f.is_empty() && !text.trim().is_empty() && !reported_nothing(&text) {
                             let tail: String = text.chars().rev().take(120).collect::<String>().chars().rev().collect();
                             let _ = txc.send(format!("⚠ agent {} returned text but 0 parseable findings (model may have produced malformed JSON). Tail: {:?}", ag.name, tail)).await;
                         }
@@ -632,19 +1144,19 @@ pub async fn run(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<Str
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} candidate finding(s) (deduped) — validating by {}-model vote", candidates.len(), cfg.vote_n)).await;
-    if pool.candidates.len() == 1 && cfg.vote_n <= 1 {
+    if pool.candidates.len() == 1 && effective_vote_n(&cfg) <= 1 {
         let _ = tx.send("⚠ single-model panel with vote_n=1 — validation is weaker (same model validates its own findings). Consider --vote-n 2 or adding a second model for cross-validation.".into()).await;
     }
 
     // ---- 4. Validate by N-model voting ---------------------------------
-    let mut findings = validate(candidates, pool, VOTE_SYS, cfg.vote_n, &tx).await;
+    let mut findings = validate(candidates, pool, VOTE_SYS, effective_vote_n(&cfg), &tx).await;
 
     // ---- 5. Attack chaining: multi-round post-exploitation pivots ------
     let chained = attack_chain(pool, &cfg, &recon, &findings, &lib.chains, &tx).await;
     findings.extend(chained);
     findings = dedup_findings(findings);
-    let findings = refute_pass(findings, pool, cfg.vote_n, &tx).await;
-    finish(cfg, lib, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await
+    let findings = refute_pass(findings, pool, effective_vote_n(&cfg), &tx).await;
+    finish(cfg, lib, pool, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await
 }
 
 /// White-box engagement: analyse a repository's source for vulnerabilities.
@@ -684,7 +1196,7 @@ pub async fn run_whitebox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: S
 
     if cfg.offline || bytes == 0 {
         let artifacts = persist(&cfg, "{}", &context, &[]);
-        return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![], agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon: String::new(), artifacts };
+        return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![], agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon: String::new(), artifacts, denied: None };
     }
 
     let raw: Vec<(String, String, Vec<Finding>)> = stream::iter(selected.iter().cloned())
@@ -723,9 +1235,9 @@ pub async fn run_whitebox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: S
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} candidate finding(s) (deduped) — validating", candidates.len())).await;
-    let findings = validate(candidates, pool, CODE_VOTE_SYS, cfg.vote_n, &tx).await;
-    let findings = refute_pass(findings, pool, cfg.vote_n, &tx).await;
-    finish(cfg, lib, "{}".into(), transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Symbolic, context, tx).await
+    let findings = validate(candidates, pool, CODE_VOTE_SYS, effective_vote_n(&cfg), &tx).await;
+    let findings = refute_pass(findings, pool, effective_vote_n(&cfg), &tx).await;
+    finish(cfg, lib, pool, "{}".into(), transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Symbolic, context, tx).await
 }
 
 /// Greybox engagement: review the source code AND exploit the running app in one
@@ -741,7 +1253,7 @@ pub async fn run_greybox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Se
     let recon = if cfg.offline {
         "{}".to_string()
     } else {
-        let p = crate::probe::probe(&cfg.target).await;
+        let p = crate::probe::probe_in_scope(&cfg.target, &effective_scope(&cfg)).await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
         let facts = crate::probe::probe_json(&p);
         match pool.complete_routed(Task::Recon, "recon", RECON_SYS,
@@ -803,7 +1315,7 @@ pub async fn run_greybox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Se
         let _ = tx.send(format!("offline: selected {} agent(s); no live exploitation", selected.len())).await;
         let artifacts = persist(&cfg, &recon, &code_leads, &[]);
         return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![],
-            agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon, artifacts };
+            agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon, artifacts, denied: None };
     }
 
     let chosen = select_agents(pool, &recon, &focus, &ranked, &tx).await;
@@ -866,12 +1378,12 @@ pub async fn run_greybox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Se
     let transcript = format!("{}\n{}", code_leads, transcript_of(&raw));
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} candidate finding(s) (deduped) — validating", candidates.len())).await;
-    let mut findings = validate(candidates, pool, VOTE_SYS, cfg.vote_n, &tx).await;
+    let mut findings = validate(candidates, pool, VOTE_SYS, effective_vote_n(&cfg), &tx).await;
     let chained = attack_chain(pool, &cfg, &recon, &findings, &lib.chains, &tx).await;
     findings.extend(chained);
     findings = dedup_findings(findings);
-    let findings = refute_pass(findings, pool, cfg.vote_n, &tx).await;
-    finish(cfg, lib, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Either, context, tx).await
+    let findings = refute_pass(findings, pool, effective_vote_n(&cfg), &tx).await;
+    finish(cfg, lib, pool, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Either, context, tx).await
 }
 
 const CHAIN_SYS: &str = "You are a post-exploitation & attack-chaining specialist. You are given ONE confirmed foothold plus any loot already gathered. DECIDE the most promising directions to expand from THIS foothold and pursue them with real tools: post-exploitation (loot credentials/tokens/keys/config/source), credential reuse, privilege escalation (horizontal AND vertical), lateral movement to adjacent services/hosts, data exfiltration, and reaching NEW attack surface the foothold exposes (e.g. SSRF→cloud metadata creds→IAM, SQLi→DB dump→credential reuse→admin, arbitrary file read→secrets→RCE, IDOR→account takeover, auth bypass→internal APIs). PROVE each escalated step with a real tool receipt. Report ONLY NEW findings beyond the input, plus any new loot you discovered (creds, tokens, hosts, internal endpoints) so later stages can reuse it. Authorized engagement; never destructive/DoS.";
@@ -920,6 +1432,7 @@ async fn attack_chain(pool: &ModelPool, cfg: &RunConfig, recon: &str,
 
     let mut all_new: Vec<Finding> = Vec::new();
     let mut loot: Vec<String> = Vec::new();
+    let mut round_summaries: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = confirmed.iter().map(finding_key).collect();
 
     // Frontier = footholds to expand this round; start with confirmed, best-first.
@@ -967,6 +1480,25 @@ async fn attack_chain(pool: &ModelPool, cfg: &RunConfig, recon: &str,
             break;
         }
         all_new.extend(validated.clone());
+        round_summaries.push(format!("round {round}: +{} validated finding(s), {} loot item(s) total", validated.len(), loot.len()));
+        // JEV / System One progress checkpoint (the jev-skill agent-checkpoint
+        // pattern): from the 2nd round on, ask a calibrated backend — TypeSafe
+        // or the local Laya shim — whether recent rounds are still productive,
+        // and stop early on a clear loop instead of burning the remaining depth.
+        // Optional: only when a decision backend is active and --typesafe ≠ off.
+        if round >= 2 && round < max_rounds
+            && !std::env::var("NEUROSPLOIT_TYPESAFE").unwrap_or_default().trim().eq_ignore_ascii_case("off")
+        {
+            if let Some(ts) = crate::typesafe::TypeSafe::from_env() {
+                let objective = cfg.objective.clone().unwrap_or_else(|| "maximise proven, chained impact".into());
+                if let Ok((label, p_continue)) = ts.progress_checkpoint(&objective, &round_summaries, round, max_rounds).await {
+                    if label == "stop" && p_continue < 0.5 {
+                        let _ = tx.send(format!("⛓ System One checkpoint ({}): rounds are looping (p_continue {:.2}) — stopping chain early", ts.backend_label(), p_continue)).await;
+                        break;
+                    }
+                }
+            }
+        }
         // Next round expands the freshly-validated footholds, best-first.
         frontier = validated;
         frontier.sort_by_key(|f| std::cmp::Reverse(sev_rank(&f.severity)));
@@ -1020,17 +1552,16 @@ async fn chain_from_seed(pool: &ModelPool, target: &str, directives: &str, recon
 /// Parse a chain agent reply into (new findings, loot). Accepts the object form
 /// `{"findings":[...],"loot":[...]}` and falls back to a bare findings array.
 fn extract_chain(text: &str, agent: &str) -> (Vec<Finding>, Vec<String>) {
-    if let (Some(a), Some(b)) = (text.find('{'), text.rfind('}')) {
-        if b > a {
-            if let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(&text[a..=b]) {
-                if o.contains_key("findings") {
-                    let findings = o.get("findings").map(|v| extract_findings(&v.to_string(), agent)).unwrap_or_default();
-                    let loot = o.get("loot").and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                        .unwrap_or_default();
-                    return (findings, loot);
-                }
-            }
+    if let Some(serde_json::Value::Object(o)) = crate::json_extract::parse_reply(text) {
+        // A chain reply wrapping its findings array (under any of the keys models
+        // use, not just "findings") also carries `loot` as a sibling — pull both.
+        let findings_arr = FINDINGS_WRAPPER_KEYS.iter().find_map(|k| o.get(*k));
+        if findings_arr.is_some() {
+            let findings = findings_arr.map(|v| extract_findings(&v.to_string(), agent)).unwrap_or_default();
+            let loot = o.get("loot").and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            return (findings, loot);
         }
     }
     (extract_findings(text, agent), vec![])
@@ -1058,12 +1589,18 @@ async fn select_agents(pool: &ModelPool, recon: &str, focus: &str, catalog: &[Ag
     let user = format!("{focus_line}RECON:\n{recon_trim}\n\nAGENT CATALOG (name — title [cwe]):\n{list}\n\nReturn a JSON array of agent names to run.");
     match pool.complete_routed(Task::Select, "select", SELECT_SYS, &user).await {
         Ok((m, text)) => {
-            let names = parse_string_array(&text);
+            let mut names = parse_string_array(&text);
             if names.is_empty() {
                 let preview: String = text.chars().take(120).collect();
                 let _ = tx.send(format!("agent selection via {} returned no parseable list ({} chars): {}", m.label(), text.len(), preview.replace('\n', " "))).await;
             } else {
                 let _ = tx.send(format!("agent selection via {} → {} agent(s) chosen", m.label(), names.len())).await;
+                // System One refinement: ask TypeSafe, in ONE batched request
+                // (the fan-out pattern), whether each chosen agent is relevant to
+                // the observed surface, and drop the ones it calibrates as clearly
+                // irrelevant. Additive — it only prunes obvious mismatches, never
+                // adds agents, and is skipped entirely when TypeSafe is absent.
+                names = typesafe_prune_agents(recon, catalog, names, tx).await;
             }
             names
         }
@@ -1074,11 +1611,103 @@ async fn select_agents(pool: &ModelPool, recon: &str, focus: &str, catalog: &[Ag
     }
 }
 
-fn parse_string_array(text: &str) -> Vec<String> {
-    match (text.find('['), text.rfind(']')) {
-        (Some(a), Some(b)) if b > a => serde_json::from_str::<Vec<String>>(&text[a..=b]).unwrap_or_default(),
-        _ => vec![],
+/// Prune agent choices TypeSafe judges irrelevant to the observed surface.
+///
+/// One request, one Noul per chosen agent (they run in parallel and cannot see
+/// one another). An agent is dropped only when the probability it is relevant is
+/// clearly low (< 0.25) — a conservative gate, because a false drop costs a
+/// missed class while a false keep only costs one agent's budget. No key, or any
+/// error, means the LLM's selection stands unchanged.
+async fn typesafe_prune_agents(recon: &str, catalog: &[Agent], chosen: Vec<String>, tx: &Sender<String>) -> Vec<String> {
+    if std::env::var("NEUROSPLOIT_TYPESAFE").unwrap_or_default().trim().to_lowercase() == "off" {
+        return chosen;
     }
+    let Some(ts) = crate::typesafe::TypeSafe::from_env() else { return chosen };
+    use std::collections::BTreeMap;
+    let mut qs: BTreeMap<String, crate::typesafe::Question> = BTreeMap::new();
+    for name in &chosen {
+        if let Some(a) = catalog.iter().find(|a| &a.name == name) {
+            qs.insert(
+                name.clone(),
+                crate::typesafe::Question::noul(
+                    &format!("Given the observed attack surface, is the '{}' test ({}, {}) relevant enough to be worth running?", a.name, a.title, a.cwe),
+                    "the surface plausibly has this class or the technique applies",
+                    "the surface shows no sign this class could exist here",
+                ),
+            );
+        }
+    }
+    if qs.is_empty() {
+        return chosen;
+    }
+    let fallback = chosen.clone(); // the LLM's selection stands on any failure
+    let state = serde_json::json!({ "recon": recon.chars().take(4000).collect::<String>() });
+    match ts.evaluate(state, qs).await {
+        Ok(answers) => {
+            let before = chosen.len();
+            let kept: Vec<String> = chosen.into_iter().filter(|name| {
+                // Keep unless TypeSafe is clearly confident it is irrelevant.
+                answers.get(name).and_then(|a| a.noul).map(|p| p >= 0.25).unwrap_or(true)
+            }).collect();
+            let dropped = before - kept.len();
+            // Never prune to nothing — a total rejection is more likely a bad
+            // question than a truly empty surface; keep the LLM's call.
+            if kept.is_empty() {
+                return fallback;
+            }
+            if dropped > 0 {
+                let _ = tx.send(format!("notify: 🧮 TypeSafe pruned {dropped} agent(s) as irrelevant to the surface")).await;
+            }
+            kept
+        }
+        Err(e) => {
+            let _ = tx.send(format!("notify: ⚠ TypeSafe agent pruning unavailable ({e}) — keeping the selection")).await;
+            fallback
+        }
+    }
+}
+
+/// Keys a model wraps a names/strings array under when it returns an object
+/// instead of the bare array we asked for — `{"agents":[…]}`, `{"selected":[…]}`.
+/// Same deviation as [`FINDINGS_WRAPPER_KEYS`], seen on the agent-selection reply;
+/// without unwrapping, a wrapped selection reads as empty and the run silently
+/// falls back to RL ranking.
+const STRING_ARRAY_WRAPPER_KEYS: &[&str] =
+    &["agents", "selected", "selection", "names", "agent_names", "chosen", "list", "items"];
+
+/// Fields that carry the string inside an array element that is an *object*
+/// (`[{"name":"sqli"}]`) rather than a bare string (`["sqli"]`).
+const STRING_ELEMENT_KEYS: &[&str] = &["name", "agent", "id", "value"];
+
+/// Pull a list of strings out of a model reply, tolerating the shapes models use
+/// when they stray from "reply with a JSON array of strings": a wrapper object
+/// around the array, and array elements that are objects carrying the string in a
+/// `name`/`agent`/`id` field.
+fn parse_string_array(text: &str) -> Vec<String> {
+    let arr = match crate::json_extract::parse_reply(text) {
+        Some(serde_json::Value::Array(a)) => a,
+        Some(serde_json::Value::Object(o)) => {
+            match STRING_ARRAY_WRAPPER_KEYS
+                .iter()
+                .find_map(|k| o.get(*k).and_then(|v| v.as_array()))
+            {
+                Some(a) => a.clone(),
+                None => return vec![],
+            }
+        }
+        _ => return vec![],
+    };
+    arr.iter()
+        .filter_map(|v| match v {
+            serde_json::Value::String(s) => Some(s.trim().to_string()),
+            serde_json::Value::Object(o) => STRING_ELEMENT_KEYS
+                .iter()
+                .find_map(|k| o.get(*k).and_then(|x| x.as_str()))
+                .map(|s| s.trim().to_string()),
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Fallback agent selection when the LLM selector fails: score each agent by
@@ -1207,6 +1836,34 @@ async fn validate(candidates: Vec<Finding>, pool: &ModelPool, sys: &str, vote_n:
                     f.review_status = "needs-review".into();
                     f.review_reason = if total == 0 { "validator unavailable".into() }
                         else { format!("below vote quorum ({yes}/{total})") };
+                } else if f.claims.is_some() {
+                    // A finding that arrived with structured claims was already
+                    // judged by `crate::claims` before the vote. The voter is
+                    // reading prose; it must not be able to delete a finding
+                    // whose mechanic the evidence supports.
+                    f.review_status = "needs-review".into();
+                    f.review_reason = format!("voter rejected the narrative, mechanic retained: {}", f.review_reason.trim());
+                    f.confidence = f.confidence.min(0.5);
+                } else if grounded_receipt(&f) {
+                    // Unanimously rejected, but the MECHANISM was demonstrated —
+                    // a real engagement rejected "no rate limiting on the reset
+                    // flow" because the agent claimed email flooding and only
+                    // proved that 25 requests went through unthrottled. The
+                    // claim was inflated; the measurement was real, and
+                    // discarding it hid a genuine gap from the report.
+                    //
+                    // So an over-claimed finding is capped and flagged rather
+                    // than deleted: the reader gets the fact, not the story
+                    // that was built on it.
+                    let cap = "Low";
+                    let was = f.severity.clone();
+                    f.severity = cap.to_string();
+                    f.review_status = "needs-review".into();
+                    f.review_reason = format!(
+                        "impact not demonstrated — capped from {was} to {cap}. Validator: {}",
+                        f.review_reason.trim()
+                    );
+                    f.confidence = f.confidence.min(0.5);
                 }
                 let label = if f.validated { "CONFIRMED" } else if f.review_status == "needs-review" { "needs-review" } else { "rejected" };
                 let _ = txc.send(format!("vote {} → {} ({})", f.title, label, f.votes)).await;
@@ -1220,6 +1877,193 @@ async fn validate(candidates: Vec<Finding>, pool: &ModelPool, sys: &str, vote_n:
     // Include no-evidence flagged findings so the human loop sees them.
     flagged.extend(validated.into_iter().filter(|f| f.validated || f.review_status == "needs-review"));
     flagged
+}
+
+/// One bounded collection round per undecided finding.
+///
+/// Only gaps another request can close trigger a round: a missing baseline is
+/// one request away, a confirmed account behind an email gate is not, and
+/// retrying the second is how a budget disappears while nothing changes.
+/// How many voters actually convene.
+///
+/// The operator's `--vote-n` is the ceiling; a budget can only narrow it, never
+/// widen it. Unlimited — the default when no flag is passed — leaves it alone,
+/// so a run nobody budgeted behaves exactly as it always did.
+fn effective_vote_n(cfg: &RunConfig) -> usize {
+    match cfg.budget.mode {
+        crate::budget::Mode::Unlimited => cfg.vote_n,
+        m => cfg.vote_n.min(m.reviewers()).max(1),
+    }
+}
+
+async fn close_evidence_gaps(cfg: &RunConfig, findings: Vec<Finding>, tx: &Sender<String>) -> Vec<Finding> {
+    if std::env::var("NEUROSPLOIT_UNCERTAINTY").unwrap_or_default() == "off" {
+        return findings;
+    }
+    let policy = effective_scope(cfg);
+    let engine = crate::replay::ReplayEngine::new(policy.clone());
+    let browser = crate::browser::BrowserProbe::new(policy);
+    // Evidence rounds are the most expensive thing per finding, so the budget
+    // sets how many there are. Unlimited keeps the default (2).
+    let rounds = match cfg.budget.mode {
+        crate::budget::Mode::Unlimited => crate::uncertainty::Rounds::default(),
+        m => crate::uncertainty::Rounds::with_max(m.evidence_rounds()),
+    };
+    if rounds.max_per_finding == 0 {
+        let _ = tx.send(format!("notify: evidence-gap closing skipped — budget {} allows 0 rounds", cfg.budget.mode.as_str())).await;
+        return findings;
+    }
+    let mut out = Vec::with_capacity(findings.len());
+    let mut closed = 0usize;
+
+    for mut f in findings {
+        let mut assessment = crate::uncertainty::assess(&f);
+        while assessment.wants_more_evidence(0.5) && rounds.take(&f.id) {
+            let actions = crate::uncertainty::next_actions(&assessment);
+            let mut fresh = crate::validation::Evidence::default();
+            let mut acted = false;
+            for action in actions {
+                match action {
+                    crate::uncertainty::Action::CaptureBaseline | crate::uncertainty::Action::Repeat => {
+                        let Some(attack) = f.evidence_data.as_ref().and_then(|e| e.attack.clone()) else { continue };
+                        let spec = crate::replay::spec_of(&attack);
+                        let (mut repeats, _) = engine.repeat(&spec, 2).await;
+                        if !repeats.is_empty() {
+                            fresh.repeats.append(&mut repeats);
+                            acted = true;
+                        }
+                    }
+                    crate::uncertainty::Action::RunBrowser => {
+                        let marker = f
+                            .evidence_data
+                            .as_ref()
+                            .map(|e| e.marker.clone())
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or_else(|| crate::validation::canary("nsxss"));
+                        let r = browser.confirm_execution(&f.endpoint, &marker, None).await;
+                        if r.available {
+                            fresh.marker = marker;
+                            fresh.browser_executed = r.proves_execution();
+                            fresh.marker_observed = r.marker_observed;
+                            fresh.notes.extend(r.notes);
+                            acted = true;
+                        }
+                    }
+                    // A second identity needs credentials the harness was not
+                    // given, and an OOB channel needs infrastructure it does not
+                    // own yet. Both are recorded as gaps rather than attempted.
+                    _ => {}
+                }
+            }
+            if !acted {
+                break;
+            }
+            crate::uncertainty::merge_evidence(&mut f, fresh);
+            let after = crate::uncertainty::assess(&f);
+            if after.uncertainty < assessment.uncertainty {
+                closed += 1;
+            }
+            assessment = after;
+        }
+        crate::uncertainty::note_gaps(&mut f, &assessment);
+        out.push(f);
+    }
+    if closed > 0 {
+        let _ = tx.send(format!("uncertainty engine: {closed} finding(s) decided after collecting more evidence")).await;
+    }
+    out
+}
+
+/// Run the Evidence Prosecutor over findings that carry claims.
+///
+/// It cannot drop anything — it returns a narrowed claim set, and the decision
+/// table downstream does the rest. Findings without claims get a ledger built
+/// from whatever they recorded, so the back catalogue is judged too instead of
+/// silently skipped.
+async fn prosecute(findings: Vec<Finding>, pool: &ModelPool, tx: &Sender<String>) -> Vec<Finding> {
+    if findings.is_empty() || std::env::var("NEUROSPLOIT_PROSECUTOR").unwrap_or_default() == "off" {
+        return findings;
+    }
+    let mut out = Vec::with_capacity(findings.len());
+    let mut narrowed = 0usize;
+    for mut f in findings {
+        let mut set = match f.claims.clone() {
+            Some(s) => s,
+            None => crate::claims::ClaimSet {
+                mechanic: crate::claims::Claim {
+                    claim: f.title.clone(),
+                    status: Some(crate::claims::ClaimStatus::Proven),
+                    evidence: Vec::new(),
+                },
+                impact: crate::claims::Claim { claim: f.impact.clone(), status: None, evidence: Vec::new() },
+                ledger: crate::prosecutor::ledger_from_finding(&f),
+                ..Default::default()
+            },
+        };
+        if set.ledger.items.is_empty() {
+            out.push(f);
+            continue;
+        }
+        // Every claim must cite the ledger it was built from; a reconstructed
+        // set has no citations yet, so seed the mechanic with what exists.
+        if set.mechanic.evidence.is_empty() {
+            set.mechanic.evidence = set.ledger.items.iter().map(|e| e.id.clone()).collect();
+        }
+        let case = crate::prosecutor::case_file(&f, &set);
+        let verdict = match pool.complete_routed(Task::Validate, "prosecutor", crate::prosecutor::PROSECUTOR_SYS, &case).await {
+            Ok((_, text)) => crate::prosecutor::parse_verdict(&text),
+            Err(_) => None,
+        };
+        if let Some(v) = verdict.filter(|v| v.coherent()) {
+            if crate::prosecutor::apply(&mut set, &v) {
+                narrowed += 1;
+                let _ = tx.send(format!(
+                    "prosecutor narrowed '{}' → {}",
+                    trunc_title(&f.title),
+                    trunc_title(&v.effective_claim(&f.title))
+                )).await;
+            }
+        }
+        f.claims = Some(set);
+        out.push(f);
+    }
+    if narrowed > 0 {
+        let _ = tx.send(format!("evidence prosecutor: {narrowed} finding(s) narrowed to what the ledger supports")).await;
+    }
+    out
+}
+
+fn trunc_title(s: &str) -> String {
+    s.chars().take(64).collect()
+}
+
+/// Assemble the claim set from an agent's reply.
+///
+/// The ledger arrives as a sibling of `claims` (agents produce it as one list
+/// rather than nesting it), so it is folded in here — a claim set without its
+/// ledger cannot resolve a single citation, and every claim would read as
+/// unsupported.
+fn parse_claims(o: &serde_json::Map<String, serde_json::Value>) -> Option<crate::claims::ClaimSet> {
+    let mut set: crate::claims::ClaimSet = o.get("claims").and_then(|v| serde_json::from_value(v.clone()).ok())?;
+    if set.ledger.items.is_empty() {
+        if let Some(items) = o.get("evidence_ledger").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+            set.ledger = crate::claims::EvidenceLedger { items };
+        }
+    }
+    Some(set)
+}
+
+/// Does this finding carry evidence a reader could check, independent of the
+/// claim built on top of it? Structured artifacts count outright; otherwise the
+/// grounding pass's own verdict decides.
+fn grounded_receipt(f: &Finding) -> bool {
+    if f.evidence_data.is_some() {
+        return true;
+    }
+    if f.review_reason.contains("receipt_missing") || f.votes.contains("receipt_missing") {
+        return false;
+    }
+    crate::grounding::ground(f, "", crate::grounding::GroundMode::Either).ok
 }
 
 /// Adversarial refutation pass: every confirmed **High/Critical** finding is
@@ -1261,7 +2105,7 @@ async fn refute_pass(findings: Vec<Finding>, pool: &ModelPool, vote_n: usize, tx
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn finish(cfg: RunConfig, _lib: &Library, recon: String, transcript: String, mut findings: Vec<Finding>,
+async fn finish(cfg: RunConfig, _lib: &Library, pool: &ModelPool, recon: String, transcript: String, mut findings: Vec<Finding>,
                 selected: Vec<Agent>, rl: &mut RlState, gmode: crate::grounding::GroundMode, source_ctx: String,
                 tx: Sender<String>) -> RunOutput {
     use crate::grounding::GroundMode;
@@ -1356,12 +2200,43 @@ async fn finish(cfg: RunConfig, _lib: &Library, recon: String, transcript: Strin
     if !findings.is_empty() {
         let _ = tx.send(format!("belief uncertainty over confirmed findings: {:.2} (0=sharp,1=diffuse)", unc)).await;
     }
+    // POMDP anti-hallucination gate: a finding asserted as confirmed while the
+    // belief about it is diffuse or weak is flagged for review. Advisory — it
+    // never deletes, only surfaces a claim the belief does not yet support.
+    let pol = crate::pomdp::Policy::default();
+    let mut gated = 0usize;
+    for f in findings.iter_mut() {
+        if f.validated && f.review_status != "needs-review" && f.review_status != "rejected" {
+            if let Err(why) = crate::pomdp::may_assert(&wm, &f.id, &pol) {
+                f.review_status = "needs-review".into();
+                f.validated = false;
+                f.review_reason = if f.review_reason.is_empty() { format!("belief gate: {why}") } else { format!("{} · belief gate: {why}", f.review_reason) };
+                gated += 1;
+            }
+        }
+    }
+    if gated > 0 {
+        let _ = tx.send(format!("belief gate: {gated} finding(s) held for review — asserted above what the evidence supports")).await;
+    }
 
     let _ = tx.send(format!("{} validated finding(s)", findings.len())).await;
+    // Grey-zone dedup via System One (TypeSafe or local Laya). The fixed 0.4
+    // Jaccard threshold cannot settle near-duplicates; when a decision backend
+    // is configured, a calibrated Noul judges each same-endpoint/CWE pair that
+    // scored in the 0.25..0.4 grey zone and merges the ones it calls the same
+    // bug. Deterministic behaviour is unchanged when no backend is set.
+    findings = merge_grey_zone_dupes(findings, &tx).await;
     // Attribution: stamp provenance into each finding (report + json + copies).
     stamp_attribution(&mut findings);
     // Map findings to OWASP / MITRE / kill-chain stage for the attack graph.
     crate::attack_graph::enrich(&mut findings);
+    // Chain them to each other. An agent sees one vulnerability and cannot link
+    // to findings it never saw, which is why `chains_from` came back empty on
+    // every finding of a real engagement; here the whole set is visible at once.
+    let chained = crate::chain::apply_links(&mut findings);
+    if chained > 0 {
+        let _ = tx.send(format!("attack paths: {chained} finding(s) linked to what enables them")).await;
+    }
     // Collect proof screenshots into evidence/<finding-id>-N.png so the report
     // can embed each image beside its vulnerability.
     if let Some(dir) = cfg.workdir.as_deref() {
@@ -1394,6 +2269,354 @@ async fn finish(cfg: RunConfig, _lib: &Library, recon: String, transcript: Strin
         let _ = tx.send("RL rewards updated".into()).await;
     }
 
+    // This finalize path is shared by every mode, so it opens its own handle on
+    // the run's trail rather than borrowing one from a particular entry point.
+    let audit = audit_log(&cfg);
+    let cap_id = capability_id(&cfg);
+
+    // The prosecutor runs first: it shrinks each claim to what the ledger
+    // supports, so the adjudication below is deciding about a statement that is
+    // already honest rather than about a story.
+    findings = prosecute(findings, pool, &tx).await;
+
+    // Claim adjudication, before anything reads the prose. Findings that
+    // arrived with separable claims get their outcome from the decision table
+    // in `crate::claims` — and an overstated impact is rewritten down to what
+    // the ledger supports instead of deleting the observation underneath it.
+    {
+        let mut rewritten = 0usize;
+        let mut dropped: Vec<String> = Vec::new();
+        let mut kept: Vec<Finding> = Vec::new();
+        for mut f in std::mem::take(&mut findings) {
+            let Some(set) = f.claims.clone() else { kept.push(f); continue };
+            let decision = crate::claims::decide(&set);
+            if decision.discards() && !crate::claims::still_security_relevant(&set) {
+                dropped.push(format!("{} ({})", f.title, decision.code()));
+                continue;
+            }
+            if decision.discards() {
+                // The narrative failed but the mechanic survives on its own —
+                // retain and rewrite rather than lose a real observation.
+                let salvage = crate::claims::Decision::DowngradeUnprovenImpact(decision.reason().to_string());
+                crate::claims::rewrite(&mut f, &set, &salvage);
+                rewritten += 1;
+            } else {
+                let before = f.title.clone();
+                crate::claims::rewrite(&mut f, &set, &decision);
+                if f.title != before {
+                    rewritten += 1;
+                }
+            }
+            kept.push(f);
+        }
+        findings = kept;
+        if rewritten > 0 || !dropped.is_empty() {
+            let _ = tx.send(format!(
+                "claim adjudication: {rewritten} finding(s) rewritten to what the evidence supports, {} dropped{}",
+                dropped.len(),
+                if dropped.is_empty() { String::new() } else { format!(" ({})", dropped.join("; ")) }
+            )).await;
+        }
+    }
+
+    // Uncertainty loop: before judging, ask whether the evidence is thin for a
+    // reason the harness can still fix. A `needs-review` verdict hands a human
+    // the same thin evidence and asks them to do the collecting — the wrong
+    // party, since the harness still has the target and the tooling.
+    findings = close_evidence_gaps(&cfg, findings, &tx).await;
+
+    // Deterministic validation. The votes above are models checking models; this
+    // pass asks whether the recorded artifacts actually demonstrate the class.
+    let vmode = crate::validation::Mode::from_env();
+    if vmode != crate::validation::Mode::Off {
+        let mut confirmed = 0usize;
+        let mut rejected: Vec<Finding> = Vec::new();
+        let mut kept: Vec<Finding> = Vec::new();
+        for mut f in findings.into_iter() {
+            match crate::validation::apply_mode(&mut f, vmode) {
+                Some(crate::validation::Verdict::Confirmed(_)) => {
+                    confirmed += 1;
+                    kept.push(f);
+                }
+                Some(crate::validation::Verdict::Rejected(r)) => {
+                    let _ = tx.send(format!("validator rejected '{}': {r}", f.title)).await;
+                    audit.append(
+                        crate::audit::AuditRecord::new("validation-engine", "reject-finding", &f.endpoint)
+                            .hypothesis(&f.id)
+                            .decision(&format!("deny: {r}"))
+                            .tool("validator")
+                            .capability(&cap_id)
+                            .evidence(f.evidence.as_bytes())
+                            .result(&format!("rejected '{}'", f.title)),
+                    );
+                    rejected.push(f);
+                }
+                _ => kept.push(f),
+            }
+        }
+        findings = kept;
+        let _ = tx.send(format!(
+            "validation engine ({:?}): {confirmed} deterministically confirmed, {} rejected, {} kept",
+            vmode, rejected.len(), findings.len()
+        )).await;
+    }
+
+    // #9 — evidence integrity: reject fabricated or re-used proof (evidence from
+    // another target, one receipt backing two classes, a foreign OAST marker,
+    // a confirmed finding with no evidence). Strips the proof, never deletes.
+    {
+        let build = crate::provenance::Provenance::process().build.clone();
+        let audits = crate::integrity::audit_evidence(&findings, &build);
+        let bad = audits.iter().filter(|a| !a.clean()).count();
+        if bad > 0 {
+            let by_id: std::collections::HashMap<&str, &crate::integrity::Audit> = audits.iter().map(|a| (a.finding_id.as_str(), a)).collect();
+            for f in findings.iter_mut() {
+                if let Some(a) = by_id.get(f.id.as_str()) {
+                    if !a.clean() {
+                        crate::integrity::apply(f, a);
+                        audit.append(
+                            crate::audit::AuditRecord::new("integrity", "reject-evidence", &f.endpoint)
+                                .hypothesis(&f.id)
+                                .decision(&format!("deny: {}", a.violations.iter().map(|v| v.reason()).collect::<Vec<_>>().join("; ")))
+                                .tool("integrity")
+                                .capability(&cap_id)
+                                .result(&f.title),
+                        );
+                    }
+                }
+            }
+        }
+        let _ = tx.send(format!("notify: 🧾 {}", crate::integrity::summary(&audits))).await;
+    }
+
+    // TypeSafe System One adjudication (optional). When TYPESAFE_API_KEY is set,
+    // a calibrated Choice over {confirmed, needs-review, rejected} plus an
+    // "impact demonstrated" Noul is asked over each finding's EVIDENCE (never
+    // its prose). Additive: it never overrules a deterministic validator —
+    // evidence still rules — it only refines confidence and moves a borderline
+    // finding to needs-review. Off with NEUROSPLOIT_TYPESAFE=off.
+    if std::env::var("NEUROSPLOIT_TYPESAFE").unwrap_or_default().trim().to_lowercase() != "off" {
+        if let Some(ts) = crate::typesafe::TypeSafe::from_env() {
+            // Additional confirmation strategy: a code-owned loop where TypeSafe
+            // picks payloads and judges responses over the REAL replay engine.
+            // Applied to enumerable-class findings that are unconfirmed or in
+            // needs-review — the recall lever. A confirmation raises the
+            // finding to validated with a calibrated probability; it never
+            // downgrades (that is the deterministic layer's job).
+            let agent = crate::typesafe_agent::TypeSafeAgent::new(ts.clone(), crate::replay::ReplayEngine::new(effective_scope(&cfg)))
+                .with_oob(cfg.oob_domain.clone());
+            let mut confirmed_by_agent = 0usize;
+            for f in findings.iter_mut() {
+                let unconfirmed = !f.validated || f.review_status == "needs-review";
+                if unconfirmed && crate::typesafe_agent::handles(&f.cwe, &f.title) {
+                    if let Some(c) = agent.confirm(f).await {
+                        audit.append(
+                            crate::audit::AuditRecord::new("typesafe-agent", "confirmation-loop", &f.endpoint)
+                                .hypothesis(&f.id)
+                                .decision(&format!("{}: {}", if c.confirmed { "confirm" } else { "inconclusive" }, c.detail))
+                                .tool("typesafe:jev-latest")
+                                .capability(&cap_id)
+                                .result(&f.title),
+                        );
+                        if c.confirmed {
+                            f.validated = true;
+                            f.review_status = "confirmed".into();
+                            f.confidence = f.confidence.max(c.probability);
+                            if f.payload.trim().is_empty() { f.payload = c.payload.clone(); }
+                            f.review_reason = format!("TypeSafe confirmation loop: {}", c.detail);
+                            confirmed_by_agent += 1;
+                        }
+                    }
+                }
+            }
+            if confirmed_by_agent > 0 {
+                let _ = tx.send(format!("notify: 🧮 TypeSafe confirmation loop confirmed {confirmed_by_agent} finding(s) the LLM path left unconfirmed")).await;
+            }
+
+            let _ = tx.send(format!("notify: 🧮 System One adjudicating findings via {}…", ts.backend_label())).await;
+            let mut refined = 0usize;
+            for f in findings.iter_mut() {
+                let state = typesafe_state(f);
+                match ts.adjudicate(state).await {
+                    Ok(adj) => {
+                        // A deterministic rejection is final; TypeSafe can only
+                        // lower confidence or flag for review, never resurrect.
+                        if f.review_status != "rejected" {
+                            let cal = adj.calibrated_confidence();
+                            // Take the more conservative of the two confidences.
+                            f.confidence = f.confidence.min(cal.max(0.05));
+                            if adj.wants_review() && f.review_status.is_empty() {
+                                f.review_status = "needs-review".into();
+                                f.validated = false;
+                                f.review_reason = format!(
+                                    "TypeSafe: p(confirmed)={:.2}, impact={:.2} — below the bar for auto-confirm",
+                                    adj.p_confirmed, adj.impact_demonstrated
+                                );
+                            }
+                            // CVSS via System One: re-grade the vector using the
+                            // calibrated impact judgment as the impact receipt,
+                            // not just the deterministic rung. A finding TypeSafe
+                            // says shows no real impact loses its C/I/A the same
+                            // way an absent receipt would — the demonstrated
+                            // score follows the evidence, calibrated.
+                            // Data type is a guardrail against over-recalibration.
+                            // The impact is only stripped when BOTH the model was
+                            // unconvinced AND nothing sensitive was actually shown
+                            // (no credential/PII signature, and the calibrated
+                            // data-sensitivity is low). A demonstrated credential
+                            // or PII exposure keeps its severity even on a thin
+                            // receipt — the KIND of data is itself the impact.
+                            let dc = crate::attack_graph::data_class(f);
+                            let sensitive_shown = dc != crate::attack_graph::DataClass::None || adj.data_sensitivity >= 0.5;
+                            if adj.impact_demonstrated < 0.5 && !sensitive_shown {
+                                if let Some(g) = crate::attack_graph::cvss_graded(f) {
+                                    let dropped = crate::cvss::grade(g.potential, |_| false);
+                                    if dropped.demonstrated_score < g.demonstrated_score {
+                                        f.cvss = format!("{:.1} ({})", dropped.demonstrated_score, dropped.demonstrated.vector_string());
+                                    }
+                                }
+                            } else if sensitive_shown && f.cvss.is_empty() {
+                                // Sensitive data shown but no score yet: grade it
+                                // WITH the data-type receipt rather than leaving it blank.
+                                if let Some(g) = crate::attack_graph::cvss_graded(f) {
+                                    if g.demonstrated_score > 0.0 {
+                                        f.cvss = format!("{:.1} ({})", g.demonstrated_score, g.demonstrated.vector_string());
+                                    }
+                                }
+                            }
+                            refined += 1;
+                        }
+                        audit.append(
+                            crate::audit::AuditRecord::new("typesafe", "adjudicate-finding", &f.endpoint)
+                                .hypothesis(&f.id)
+                                .decision(&format!("{}: p_confirmed={:.2} impact={:.2} conf={:.2}", adj.verdict, adj.p_confirmed, adj.impact_demonstrated, adj.confidence))
+                                .tool("typesafe:jev-latest")
+                                .capability(&cap_id)
+                                .result(&f.title),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("notify: ⚠ TypeSafe unavailable ({e}) — keeping deterministic verdicts")).await;
+                        break; // don't hammer a failing service
+                    }
+                }
+            }
+            if refined > 0 {
+                let _ = tx.send(format!("notify: 🧮 TypeSafe refined {refined} finding(s) with calibrated confidence")).await;
+            }
+        }
+    }
+
+    // PoC re-validation: re-run each finding's recorded proof and demote any
+    // that no longer reproduces. This is the harness checking its own work — a
+    // bug that was hotfixed between discovery and reporting, or a "proof" that
+    // was a fluke, is caught here rather than by the client.
+    if cfg.revalidate_poc {
+        let validator = crate::poc::PocValidator::new(effective_scope(&cfg));
+        let results = validator.validate_all(&findings).await;
+        let _ = tx.send(format!("notify: 🔁 {}", crate::poc::summary(&results))).await;
+        let by_id: std::collections::HashMap<&str, &crate::poc::PocResult> = results.iter().map(|r| (r.finding_id.as_str(), r)).collect();
+        for f in findings.iter_mut() {
+            if let Some(r) = by_id.get(f.id.as_str()) {
+                crate::poc::apply(f, r);
+                if r.reproduction.demotes() {
+                    audit.append(
+                        crate::audit::AuditRecord::new("poc-validator", "poc-revalidation", &f.endpoint)
+                            .hypothesis(&f.id)
+                            .decision(&format!("{}: {}", r.reproduction.as_str(), r.detail))
+                            .tool("poc-validator")
+                            .capability(&cap_id)
+                            .result(&f.title),
+                    );
+                }
+            }
+        }
+    }
+
+    // Scope audit: anything proven against a host outside the authorization
+    // boundary is quarantined, not shipped. A finding on an unauthorized asset
+    // is an incident to disclose, not a deliverable.
+    let policy = effective_scope(&cfg);
+    let (in_scope, out_of_scope) = policy.audit_findings(findings);
+    findings = in_scope;
+    if !out_of_scope.is_empty() {
+        for f in &out_of_scope {
+            // The record of a boundary violation is the point: this is the
+            // line an operator has to be able to show afterwards.
+            audit.append(
+                crate::audit::AuditRecord::new(&f.agent, "finding-out-of-scope", &f.endpoint)
+                    .hypothesis(&f.id)
+                    .decision("deny: proven against a host outside the authorized scope")
+                    .tool("scope-guard")
+                    .capability(&cap_id)
+                    .evidence(f.evidence.as_bytes())
+                    .result("withheld from the report"),
+            );
+        }
+        let _ = tx.send(format!(
+            "notify: ⚠ {} finding(s) were proven against hosts OUTSIDE the authorized scope and were withheld: {}",
+            out_of_scope.len(),
+            out_of_scope.iter().map(|f| crate::scope::host_of(&f.endpoint)).collect::<Vec<_>>().join(", ")
+        )).await;
+        if let Some(dir) = cfg.workdir.as_deref() {
+            let p = Path::new(dir).join("out-of-scope-findings.json");
+            let _ = std::fs::write(p, serde_json::to_string_pretty(&out_of_scope).unwrap_or_default());
+        }
+    }
+
+    // Every finding that survives to the report gets a record tying it to the
+    // evidence it was proven with — that hash is what links a claim in a PDF to
+    // the artifact behind it months later.
+    for f in &findings {
+        audit.append(
+            crate::audit::AuditRecord::new(&f.agent, "report-finding", &f.endpoint)
+                .hypothesis(&f.id)
+                .decision(&format!("allow: {}", if f.review_status.is_empty() { "reported" } else { &f.review_status }))
+                .tool("pipeline")
+                .capability(&cap_id)
+                .evidence(f.evidence.as_bytes())
+                .result(&format!("[{}] {}", f.severity, f.title)),
+        );
+    }
+    audit.append(
+        crate::audit::AuditRecord::new("harness", "engagement-end", &cfg.target)
+            .decision("allow")
+            .tool("neurosploit")
+            .capability(&cap_id)
+            .result(&format!("{} finding(s) reported", findings.len())),
+    );
+    // P4 — anchor the chain: a signed checkpoint of the head, written locally
+    // and (if NEUROSPLOIT_ANCHOR_DIR is set) to external append-only storage.
+    // This is what makes a later truncation or silent rebuild detectable.
+    let anchor_key = provenance_key().unwrap_or_else(|| crate::provenance::Provenance::build_fingerprint().into_bytes());
+    let anchor = audit.checkpoint(&anchor_key, "engagement-end");
+    let _ = tx.send(format!(
+        "notify: ⚓ audit anchored — {} record(s), head {}{}",
+        anchor.count,
+        anchor.chain_hash.chars().take(12).collect::<String>(),
+        if provenance_key().is_some() { " (signed)" } else { " (unsigned — set NEUROSPLOIT_PROVENANCE_KEY)" }
+    )).await;
+    match audit.verify() {
+        Ok(n) => {
+            let _ = tx.send(format!("audit trail: {n} record(s), hash chain intact → audit.jsonl")).await;
+        }
+        Err(e) => {
+            // Worth shouting about: the trail is the artifact that proves what
+            // was done, and a broken chain means it can no longer do that.
+            let _ = tx.send(format!("notify: ⚠ audit chain verification FAILED — {e}")).await;
+        }
+    }
+
+    // Durable knowledge. Everything above this point is about *this* run; these
+    // two stores are what makes the next one start from further along.
+    let notes = absorb(&cfg, &recon, &findings);
+    for n in notes {
+        let _ = tx.send(n).await;
+    }
+
+    // Coverage report: what was tested, how, and what was NOT —
+    // so a reader can see the engagement's reach, not just its findings.
+    write_coverage(&cfg, &selected, &findings);
     let artifacts = persist(&cfg, &recon, &transcript, &findings);
     if !artifacts.is_empty() {
         let _ = tx.send(format!("notify: evidence saved → {}", cfg.workdir.clone().unwrap_or_default())).await;
@@ -1416,10 +2639,167 @@ async fn finish(cfg: RunConfig, _lib: &Library, recon: String, transcript: Strin
         agents_ran: selected.iter().map(|a| a.name.clone()).collect(),
         recon,
         artifacts,
+        denied: None,
     }
 }
 
+/// Fold a finished run into the attack knowledge graph and the layered memory.
+///
+/// Returns the lines to report to the operator. It is deliberately synchronous
+/// and returns its messages instead of sending them: the memory store is behind
+/// a `std::sync::Mutex`, and holding that guard across an `.await` would make
+/// the pipeline future non-`Send`.
+fn absorb(cfg: &RunConfig, recon: &str, findings: &[Finding]) -> Vec<String> {
+    let mut out = Vec::new();
+    let rid = run_id(cfg);
+    let store = proj_store(cfg);
+
+    // Graph: the project-wide one accumulates across runs, and each run keeps
+    // its own copy so the report and the web console can draw just this run.
+    let proj_graph = store.join("graph.json");
+    let mut kg = crate::knowledge_graph::KnowledgeGraph::load(&proj_graph);
+    kg.ingest(&cfg.target, &rid, findings);
+    kg.save(&proj_graph);
+    if let Some(dir) = cfg.workdir.as_deref() {
+        let mut run_kg = crate::knowledge_graph::KnowledgeGraph::new();
+        run_kg.ingest(&cfg.target, &rid, findings);
+        run_kg.save(Path::new(dir).join("graph.json"));
+    }
+    let paths = kg.paths(1);
+    let depth = paths.first().map(|(p, _)| p.len()).unwrap_or(0);
+    out.push(format!(
+        "knowledge graph: {} node(s), {} edge(s), longest attack path {} step(s) → graph.json",
+        kg.nodes.len(),
+        kg.edges.len(),
+        depth
+    ));
+
+    // Memory: what was proven is engagement knowledge immediately (a validated
+    // finding is evidence, not a guess); everything else has to earn promotion.
+    let key = crate::memory::engagement_key(&cfg.target);
+    let Ok(mut mem) = crate::memory::shared(store.join("memory")).lock() else { return out };
+
+    for f in findings {
+        let where_ = if f.endpoint.is_empty() { cfg.target.as_str() } else { f.endpoint.as_str() };
+        let text = format!("{} — {} on {} [{} · {}]", f.title, f.severity, where_, f.cwe, f.stage);
+        let mut tags: Vec<String> = vec![format!("agent:{}", f.agent)];
+        if !f.cwe.is_empty() {
+            tags.push(format!("cwe:{}", f.cwe));
+        }
+        if !f.mitre.is_empty() {
+            tags.push(format!("technique:{}", f.mitre));
+        }
+        if !f.stage.is_empty() {
+            tags.push(f.stage.clone());
+        }
+        let refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+        mem.remember(
+            crate::memory::Tier::Engagement,
+            &key,
+            &text,
+            &refs,
+            &cfg.target,
+            &rid,
+            f.confidence.clamp(0.4, 0.95),
+        );
+    }
+
+    // Recon facts go to working memory: one sighting of an endpoint is a lead,
+    // and only a repeat earns a place in the engagement's knowledge.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(recon) {
+        for k in ["endpoints", "apis", "hosts", "subdomains"] {
+            if let Some(arr) = v.get(k).and_then(|x| x.as_array()) {
+                for item in arr.iter().take(25) {
+                    let s = item.as_str().map(|s| s.to_string()).unwrap_or_else(|| item.to_string());
+                    let s = s.trim_matches('"').trim();
+                    if s.len() > 2 {
+                        mem.note(&cfg.target, &rid, &format!("{k}: {s}"), &["recon", k]);
+                    }
+                }
+            }
+        }
+        if let Some(tech) = v.get("tech").and_then(|x| x.as_array()) {
+            let list: Vec<String> = tech.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect();
+            if !list.is_empty() {
+                mem.note(&cfg.target, &rid, &format!("stack: {}", list.join(", ")), &["recon", "tech"]);
+            }
+        }
+    }
+
+    // Recall only earns credit when the run it informed actually found something.
+    if !findings.is_empty() {
+        mem.credit_recalled();
+    }
+    mem.decay(0.98);
+    let (e, t, r) = mem.consolidate(&cfg.target, &rid);
+    let (w, eng, tech, reuse) = mem.counts();
+    out.push(format!(
+        "memory: +{e} engagement, +{t} technique, +{r} reusable (now {w}/{eng}/{tech}/{reuse}) → memory/"
+    ));
+    out
+}
+
+/// Key used to sign the run manifest.
+///
+/// Separate from the capability key on purpose: one authorizes a run, the other
+/// attests to its output, and an operator who can start engagements should not
+/// thereby be able to sign reports as the engine.
+fn provenance_key() -> Option<Vec<u8>> {
+    std::env::var("NEUROSPLOIT_PROVENANCE_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.into_bytes())
+}
+
 /// Write recon/exploit/findings/report as json+md for downstream reuse.
+/// Write `coverage.md`: which agents ran (the tested surface), how many
+/// findings each produced, and which high-value classes were NOT covered by the
+/// selected agents. This is the "what did the pentest actually test" view.
+fn write_coverage(cfg: &RunConfig, selected: &[Agent], findings: &[Finding]) {
+    let Some(dir) = cfg.workdir.as_deref() else { return };
+    let mut per_agent: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for f in findings { *per_agent.entry(f.agent.as_str()).or_insert(0) += 1; }
+
+    let mut s = format!("# Coverage — {}\n\n", cfg.target);
+    s.push_str(&format!("{} agent(s) ran against the target. This is what was tested and what was not.\n\n", selected.len()));
+    s.push_str("## Tested\n\n| Agent | Class | Findings |\n|---|---|---|\n");
+    for a in selected {
+        let n = per_agent.get(a.name.as_str()).copied().unwrap_or(0);
+        s.push_str(&format!("| `{}` | {} | {} |\n", a.name, if a.cwe.is_empty() { a.title.as_str() } else { a.cwe.as_str() }, n));
+    }
+
+    // High-value classes a black-box web engagement should reach; flag any the
+    // selected agent names did not obviously cover, as an honest "not tested".
+    const EXPECTED: &[(&str, &[&str])] = &[
+        ("SQL injection", &["sqli"]),
+        ("Cross-site scripting", &["xss"]),
+        ("Access control / IDOR / BOLA", &["idor", "bola", "bfla", "access"]),
+        ("Authentication / session", &["auth", "jwt", "session", "login"]),
+        ("SSRF", &["ssrf"]),
+        ("Open redirect", &["redirect"]),
+        ("File upload / path traversal", &["upload", "lfi", "traversal", "path"]),
+        ("CSRF", &["csrf"]),
+        ("Injection (cmd/template/XXE)", &["command", "ssti", "template", "xxe", "injection"]),
+        ("Rate limiting", &["rate", "brute"]),
+        ("Security misconfig / headers", &["header", "cors", "misconfig", "clickjack"]),
+        ("Secrets / disclosure", &["secret", "disclosure", "exposure", "info"]),
+    ];
+    let names: String = selected.iter().map(|a| a.name.to_lowercase()).collect::<Vec<_>>().join(" ");
+    let mut not_tested = Vec::new();
+    for (label, kws) in EXPECTED {
+        if !kws.iter().any(|k| names.contains(k)) { not_tested.push(*label); }
+    }
+    s.push_str("\n## Not tested (no agent selected for these classes)\n\n");
+    if not_tested.is_empty() {
+        s.push_str("All high-value web classes had at least one agent selected.\n");
+    } else {
+        for c in &not_tested { s.push_str(&format!("- {c}\n")); }
+        s.push_str("\n> These were out of the selected agent set for this run (recon-driven or `--only`). Re-run without a narrow focus, or add the agents explicitly, to cover them.\n");
+    }
+    let _ = std::fs::write(std::path::Path::new(dir).join("coverage.md"), s);
+}
+
 fn persist(cfg: &RunConfig, recon: &str, transcript: &str, findings: &[Finding]) -> Vec<String> {
     let Some(dir) = &cfg.workdir else { return vec![] };
     let dir = PathBuf::from(dir);
@@ -1438,10 +2818,55 @@ fn persist(cfg: &RunConfig, recon: &str, transcript: &str, findings: &[Finding])
     if !transcript.is_empty() {
         put("exploitation.md", format!("# Agent transcript — {}\n\n{}", cfg.target, transcript));
     }
-    put("findings.json", serde_json::to_string_pretty(findings).unwrap_or_else(|_| "[]".into()));
+    // Provenance: every finding carries the build that produced it, and a
+    // signed manifest ships beside them so the set can be checked later
+    // without trusting the filename it arrived under.
+    let prov = crate::provenance::Provenance::process();
+    let findings_json = match serde_json::to_value(findings) {
+        Ok(serde_json::Value::Array(mut items)) => {
+            for item in items.iter_mut() {
+                prov.stamp(item);
+            }
+            serde_json::to_string_pretty(&serde_json::Value::Array(items)).unwrap_or_else(|_| "[]".into())
+        }
+        _ => serde_json::to_string_pretty(findings).unwrap_or_else(|_| "[]".into()),
+    };
+    put("findings.json", findings_json);
+    let manifest = prov.manifest(&cfg.target, findings);
+    let manifest = match provenance_key() {
+        Some(k) => manifest.sign(&k),
+        // No key is not a failure: the manifest still names the build, it just
+        // cannot prove it. Saying so beats a signature nobody can verify.
+        None => manifest,
+    };
+    put("provenance.json", serde_json::to_string_pretty(&manifest).unwrap_or_default());
+    // P5 — the assurance bundle: one manifest of every artifact + hashes,
+    // signed, so a reviewer can verify the whole run independently. Built last
+    // so it hashes the files just written above.
+    let bundle = crate::assurance::Bundle::build(&dir);
+    let bundle = match provenance_key() {
+        Some(k) => bundle.sign(&k),
+        None => bundle,
+    };
+    put("assurance.json", serde_json::to_string_pretty(&bundle).unwrap_or_default());
     put("findings.md", findings_md(&cfg.target, findings));
+    // Compliance mapping, one file per requested framework. Confirmed findings
+    // only — a lead is not a control gap.
+    for fw_name in &cfg.compliance {
+        if let Some(fw) = crate::compliance::Framework::parse(fw_name) {
+            let report = crate::compliance::map_findings(findings, fw, true);
+            put(&format!("compliance-{}.md", fw.as_str()), report.to_markdown());
+        }
+    }
     let meta = cfg.workdir.as_deref().map(|d| report::read_meta(Path::new(d))).unwrap_or_default();
-    put("report.html", report::html(&cfg.target, findings, &meta));
+    let pocs: Vec<String> = std::fs::read_dir(dir.join("pocs"))
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+        .unwrap_or_default();
+    let mut report_html = report::html_with_pocs(&cfg.target, findings, &meta, &pocs);
+    if !cfg.compliance.is_empty() {
+        report_html = report::with_compliance(report_html, findings, &cfg.compliance);
+    }
+    put("report.html", report_html);
     written
 }
 
@@ -1466,39 +2891,101 @@ fn transcript_of(raw: &[(String, String, Vec<Finding>)]) -> String {
 /// (0.9), a numeric string ("0.9"), or a word ("High"); `cvss` may be a number or
 /// a string. Strict typed deserialization fails the whole batch on any mismatch,
 /// so we parse leniently into `Value` and coerce every field.
-fn extract_findings(text: &str, agent: &str) -> Vec<Finding> {
-    let slice = match (text.find('['), text.rfind(']')) {
-        (Some(a), Some(b)) if b > a => &text[a..=b],
-        _ => match (text.find('{'), text.rfind('}')) {
-            (Some(a), Some(b)) if b > a => &text[a..=b],
-            _ => {
-                if !text.trim().is_empty() && text.trim() != "[]" {
-                    eprintln!("[extract_findings] agent {agent}: model returned text but no JSON array/object found (len={}); raw tail: {:?}",
-                        text.len(), &text[text.len().saturating_sub(200)..]);
+/// Did the agent explicitly report an empty result?
+///
+/// Accepts a bare `[]`, a fenced ```json block containing one, and an empty
+/// findings wrapper (`{"findings":[]}`, `{"vulnerabilities":[]}`, … — see
+/// [`FINDINGS_WRAPPER_KEYS`]) — all mean "I looked and found nothing".
+fn reported_nothing(text: &str) -> bool {
+    if text.trim() == "[]" {
+        return true;
+    }
+    // Same lenient extractor the finding parser uses, so "nothing found" and
+    // "here are the findings" are decided from the exact same value — they can
+    // never disagree about which region of the reply is the answer.
+    match crate::json_extract::parse_reply(text) {
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        Some(serde_json::Value::Object(o)) => FINDINGS_WRAPPER_KEYS
+            .iter()
+            .find_map(|k| o.get(*k).and_then(|f| f.as_array()))
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Last `n` characters of `s`, on a char boundary (diagnostics only).
+fn tail(s: &str, n: usize) -> String {
+    let total = s.chars().count();
+    s.chars().skip(total.saturating_sub(n)).collect()
+}
+
+/// Keys a model wraps its findings array under when it ignores "reply with ONLY
+/// a JSON array" and returns an object instead — `{"findings":[…]}`,
+/// `{"vulnerabilities":[…]}`, etc. Seen most on black-box runs, where the reply
+/// follows a long tool-use turn and the model narrates into a report object. None
+/// of these names collide with a finding's own fields, so unwrapping is safe.
+const FINDINGS_WRAPPER_KEYS: &[&str] =
+    &["findings", "vulnerabilities", "vulns", "results", "issues"];
+
+/// Normalise a parsed reply into the list of candidate finding objects.
+///
+/// - An array *is* the list.
+/// - An object carrying a non-empty `title` is a single bare finding object.
+/// - Otherwise an object wrapping one of [`FINDINGS_WRAPPER_KEYS`] unwraps to that
+///   array — without this a real batch returned as `{"findings":[…]}` is treated
+///   as one title-less "finding", dropped, and surfaces to the operator as
+///   "returned text but 0 parseable findings" while the findings are lost.
+/// - Any other object is passed through as a single finding object (so a bare
+///   finding using a non-standard title key still reaches the field coercion).
+fn findings_items(val: serde_json::Value) -> Vec<serde_json::Value> {
+    match val {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(o) => {
+            let has_title = o
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
+            if !has_title {
+                for k in FINDINGS_WRAPPER_KEYS {
+                    if let Some(serde_json::Value::Array(a)) = o.get(*k) {
+                        return a.clone();
+                    }
                 }
-                return vec![];
             }
-        },
-    };
-    let val: serde_json::Value = match serde_json::from_str(slice) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[extract_findings] agent {agent}: JSON parse failed: {e}; slice head: {:?}",
-                &slice[..slice.len().min(300)]);
-            // Attempt to salvage: strip trailing comma before ] (common LLM mistake)
-            let fixed = slice.replace(",]", "]").replace(",}", "}");
-            match serde_json::from_str(&fixed) {
-                Ok(v) => v,
-                Err(_) => return vec![],
+            vec![serde_json::Value::Object(o)]
+        }
+        _ => vec![],
+    }
+}
+
+/// Pull the findings array out of a model's reply.
+///
+/// Locating and parsing the JSON is delegated to [`crate::json_extract`], which
+/// is string-aware (prose brackets like `[low] …` no longer start the span),
+/// prefers the last fenced block, and tolerates the deviations that used to sink
+/// a whole batch — fenced/capitalised tags, trailing commas, comments, single
+/// quotes, and replies truncated by a token limit. The two failures seen on live
+/// runs (`JSON parse failed` and `no JSON array/object found`) now collapse into
+/// one honest outcome: either we recover a value, or the reply held no JSON.
+/// The recovered value's *shape* is then normalised by [`findings_items`].
+fn extract_findings(text: &str, agent: &str) -> Vec<Finding> {
+    let val = match crate::json_extract::parse_reply(text) {
+        Some(v) => v,
+        None => {
+            let t = text.trim();
+            if !t.is_empty() && t != "[]" {
+                eprintln!(
+                    "[extract_findings] agent {agent}: no parseable JSON in model reply (len={}); raw tail: {:?}",
+                    text.len(),
+                    tail(text, 200)
+                );
             }
+            return vec![];
         }
     };
-    let items: Vec<serde_json::Value> = match val {
-        serde_json::Value::Array(a) => a,
-        serde_json::Value::Object(_) => vec![val],
-        _ => return vec![],
-    };
-    items
+    findings_items(val)
         .into_iter()
         .filter_map(|it| {
             let o = it.as_object()?;
@@ -1523,6 +3010,16 @@ fn extract_findings(text: &str, agent: &str) -> Vec<Finding> {
                 endpoint: s(o, "endpoint"),
                 payload: s(o, "payload"),
                 evidence: s(o, "evidence"),
+                location: s(o, "location"),
+                repro_steps: o.get("repro_steps").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(|t| t.to_string())).collect())
+                    .unwrap_or_default(),
+                // Structured artifacts for the deterministic validators. Without
+                // this the evidence contract in the prompt goes to an agent that
+                // dutifully fills it in and a parser that throws it away — the
+                // whole validation engine would sit idle on live runs.
+                evidence_data: o.get("evidence_data").and_then(|v| serde_json::from_value(v.clone()).ok()),
+                claims: parse_claims(o),
                 impact: s(o, "impact"),
                 remediation: s(o, "remediation"),
                 confidence: conf(o.get("confidence")),
@@ -1683,10 +3180,162 @@ fn conf(v: Option<&serde_json::Value>) -> f64 {
 
 /// Drop duplicate findings (same CWE + endpoint + lowercased title) that
 /// different agents/models may each report, keeping the highest-confidence one.
+/// Merge the same finding reported by several agents.
+///
+/// The old key was `cwe|endpoint|title[..40]`, and a live engagement showed why
+/// that fails: one cookie issue came back five times and one missing header
+/// four, because each agent writes the CWE as `CWE-614` or
+/// `CWE-614 (Sensitive Cookie in HTTPS Session Without Secure Attribute)`, and
+/// the endpoint as `https://host/` or `GET https://host/ (and /Account/Login)`.
+/// Worse, the severities disagreed — the same issue arrived as Low from one
+/// agent and Medium from another, which is indefensible in a report.
+///
+/// Grouping by `(cwe number, normalized endpoint)` alone would over-merge:
+/// missing `nosniff`, `Referrer-Policy` and `Permissions-Policy` are all
+/// CWE-693 on `/` and are three separate fixes. So within a group, entries
+/// merge only when their titles are actually about the same thing (token
+/// overlap), and the survivor keeps the HIGHEST severity with the fullest
+/// evidence — agreement between independent agents raises confidence, it does
+/// not lower severity.
+/// A calibrated second pass over the grey zone the fixed-threshold deduper
+/// leaves behind: same endpoint + CWE, title overlap in 0.25..0.40 (below the
+/// merge cutoff but not clearly distinct). Only runs when a System One backend
+/// (TypeSafe or Laya) is configured; otherwise the input is returned untouched.
+async fn merge_grey_zone_dupes(findings: Vec<Finding>, tx: &Sender<String>) -> Vec<Finding> {
+    if std::env::var("NEUROSPLOIT_TYPESAFE").unwrap_or_default().trim().to_lowercase() == "off" {
+        return findings;
+    }
+    let Some(ts) = crate::typesafe::TypeSafe::from_env() else { return findings };
+    if findings.len() < 2 {
+        return findings;
+    }
+    let mut kept: Vec<Finding> = Vec::new();
+    let mut merged_count = 0usize;
+    'outer: for f in findings {
+        for k in kept.iter_mut() {
+            if cwe_num(&k.cwe) != cwe_num(&f.cwe) || endpoint_key(&k.endpoint) != endpoint_key(&f.endpoint) {
+                continue;
+            }
+            let ov = title_overlap(&k.title, &f.title);
+            // < 0.25: clearly different, leave apart. >= 0.40: dedup already
+            // merged it. Only the grey band is worth a calibrated call.
+            if (0.25..0.40).contains(&ov) {
+                if let Ok(p) = ts.same_finding(&k.title, &k.evidence, &f.title, &f.evidence).await {
+                    if p >= 0.6 {
+                        if k.evidence.len() < f.evidence.len() { k.evidence = f.evidence.clone(); }
+                        if k.evidence_data.is_none() { k.evidence_data = f.evidence_data.clone(); }
+                        merged_count += 1;
+                        continue 'outer;
+                    }
+                }
+            }
+        }
+        kept.push(f);
+    }
+    if merged_count > 0 {
+        let _ = tx.send(format!("notify: 🧮 {} merged {merged_count} grey-zone duplicate(s)", ts.backend_label())).await;
+    }
+    kept
+}
+
 fn dedup_findings(mut v: Vec<Finding>) -> Vec<Finding> {
-    v.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
-    let mut seen = std::collections::HashSet::new();
-    v.into_iter().filter(|f| seen.insert(finding_key(f))).collect()
+    v.sort_by(|a, b| {
+        sev_rank(&b.severity)
+            .cmp(&sev_rank(&a.severity))
+            .then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+            .then(b.evidence.len().cmp(&a.evidence.len()))
+    });
+    let mut kept: Vec<Finding> = Vec::new();
+    let mut corroborators: Vec<Vec<String>> = Vec::new();
+    for f in v {
+        let mut merged = false;
+        for (i, k) in kept.iter_mut().enumerate() {
+            if cwe_num(&k.cwe) == cwe_num(&f.cwe)
+                && endpoint_key(&k.endpoint) == endpoint_key(&f.endpoint)
+                // 0.4, calibrated on real engagement output: two phrasings of
+                // the cookie issue score 0.44, while `Referrer-Policy` and
+                // `Permissions-Policy` (both CWE-693 on the same path, and
+                // genuinely different fixes) score 0.33 and stay apart.
+                && title_overlap(&k.title, &f.title) >= 0.4
+            {
+                // Keep whatever the duplicate knew that the survivor did not.
+                if k.evidence.len() < f.evidence.len() {
+                    k.evidence = f.evidence.clone();
+                }
+                if k.remediation.is_empty() {
+                    k.remediation = f.remediation.clone();
+                }
+                if k.repro_steps.is_empty() {
+                    k.repro_steps = f.repro_steps.clone();
+                }
+                if k.evidence_data.is_none() {
+                    k.evidence_data = f.evidence_data.clone();
+                }
+                if !f.agent.is_empty() && f.agent != k.agent && !corroborators[i].contains(&f.agent) {
+                    corroborators[i].push(f.agent.clone());
+                }
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            kept.push(f);
+            corroborators.push(Vec::new());
+        }
+    }
+    for (f, also) in kept.iter_mut().zip(corroborators) {
+        if !also.is_empty() {
+            // Independent agreement is a confidence signal and belongs in the
+            // report, not on the cutting-room floor.
+            let note = format!("corroborated by {}", also.join(", "));
+            f.votes = if f.votes.is_empty() { note } else { format!("{} · {note}", f.votes) };
+            f.confidence = (f.confidence + 0.05 * also.len() as f64).min(0.99);
+        }
+    }
+    kept
+}
+
+/// Just the digits of a CWE id, so `CWE-614` and `CWE-614 (Sensitive Cookie…)`
+/// are the same weakness.
+fn cwe_num(cwe: &str) -> String {
+    cwe.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect()
+}
+
+/// Host + path of the first URL in an endpoint field, however the agent dressed
+/// it up (`GET https://h/p`, `https://h/p (and /other)`, `https://h/p?x=1`).
+fn endpoint_key(endpoint: &str) -> String {
+    let e = endpoint.trim();
+    let token = e
+        .split_whitespace()
+        .find(|t| t.contains("://") || t.starts_with('/'))
+        .unwrap_or(e)
+        .trim_matches(|c: char| c == ',' || c == '(' || c == ')');
+    let no_scheme = token.split_once("://").map(|(_, r)| r).unwrap_or(token);
+    let no_query = no_scheme.split(['?', '#']).next().unwrap_or(no_scheme);
+    no_query.trim_end_matches('/').trim_start_matches("www.").to_lowercase()
+}
+
+/// Jaccard overlap of the meaningful words in two titles. Two phrasings of the
+/// same issue share most of them; "missing nosniff" and "missing
+/// Referrer-Policy" do not.
+fn title_overlap(a: &str, b: &str) -> f64 {
+    const NOISE: &[&str] = &["the", "a", "an", "of", "on", "in", "at", "to", "and", "or", "for", "with", "without", "over", "set", "is", "are", "no", "not", "missing"];
+    let words = |s: &str| -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|w| w.len() > 2 && !NOISE.contains(w))
+            .map(|w| w.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let (x, y) = (words(a), words(b));
+    if x.is_empty() || y.is_empty() {
+        return 0.0;
+    }
+    let inter = x.iter().filter(|w| y.contains(*w)).count() as f64;
+    let union = (x.len() + y.len()) as f64 - inter;
+    if union == 0.0 { 0.0 } else { inter / union }
 }
 
 fn norm_sev(s: &str) -> String {
@@ -1740,6 +3389,178 @@ fn collect_repo_context(root: &Path, max_files: usize, max_bytes: usize) -> Stri
     out
 }
 
+const CONTAINER_RECON_SYS: &str = "You are a container security recon specialist on an AUTHORIZED assessment of an OCI container image (a registry ref like repo/name:tag, a local tar, or a Dockerfile). Identify the image, its base image and OS, the layer count, the package ecosystems present, the entrypoint/exposed ports, and whether it runs as root. Pull/inspect read-only (trivy/syft/crane/docker). Do not push, delete or modify anything. Reply with a compact JSON object (image, base, os, layers, ecosystems, runs_as_root, ports). No prose.";
+
+const CONTAINER_TOOLING: &str = "TOOLING (all read-only, provision on demand, time-box installs): `trivy image` (vuln/secret/misconfig scanners, JSON output), `grype` (vulns), `syft` (SBOM: SPDX + CycloneDX), `crane`/`skopeo` (inspect/export without a daemon), `docker save`/`docker history`, `trufflehog`/`gitleaks` (secrets in extracted layers), `hadolint` (Dockerfile). Write SBOMs into $NEUROSPLOIT_POCS/../sbom or the run's sbom/ folder. Never push/delete/modify a registry; redact secrets to a masked sample.\n\n";
+
+/// Container image engagement: scan an OCI image (or Dockerfile) for vulnerable
+/// packages, exposed secrets, misconfigurations, and produce an SBOM. Mirrors
+/// the host pipeline; the target is an image ref and the agent set is `container`.
+pub async fn run_container(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<String>) -> RunOutput {
+    pool.set_progress(tx.clone());
+    // The SBOM lands next to the run's pocs.
+    if let Some(w) = cfg.workdir.as_deref() { let _ = std::fs::create_dir_all(std::path::Path::new(w).join("sbom")); }
+    let _ = tx.send(format!("CONTAINER - image: {} - {} container agents - models: {}", cfg.target, lib.container.len(),
+        pool.candidates.iter().map(|m| m.label()).collect::<Vec<_>>().join(", "))).await;
+
+    let recon = if cfg.offline {
+        "{}".to_string()
+    } else {
+        let user = format!("{}{}Image: {}", operator_directives(&cfg), CONTAINER_TOOLING, cfg.target);
+        match pool.complete_routed(Task::Recon, "recon", CONTAINER_RECON_SYS, &user).await {
+            Ok((m, t)) => { let _ = tx.send(format!("recon complete via {}", m.label())).await; t }
+            Err(e) => { let _ = tx.send(format!("recon failed ({e})")).await; "{}".to_string() }
+        }
+    };
+
+    let mut rl = cfg.rl_path.as_ref().map(|p| RlState::load(Path::new(p))).unwrap_or_default();
+    let mut ranked: Vec<Agent> = lib.container.clone();
+    ranked.sort_by(|a, b| rl.weight(&b.name).partial_cmp(&rl.weight(&a.name)).unwrap_or(std::cmp::Ordering::Equal));
+    let cap = if cfg.max_agents > 0 { cfg.max_agents.min(ranked.len()) } else { ranked.len() };
+    let focus = cfg.instructions.clone().unwrap_or_default();
+
+    if cfg.offline {
+        let selected: Vec<Agent> = ranked.into_iter().take(cap).collect();
+        let _ = tx.send(format!("offline: selected {} container agent(s); no live scan", selected.len())).await;
+        let artifacts = persist(&cfg, &recon, "", &[]);
+        return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![],
+            agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon, artifacts, denied: None };
+    }
+
+    // Container agents are complementary (vuln/secret/misconfig/sbom) — run them
+    // all rather than a recon-based subset.
+    let selected: Vec<Agent> = ranked.into_iter().take(cap).collect();
+    let _ = tx.send(format!("running {} container agent(s): {}", selected.len(),
+        selected.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", "))).await;
+
+    let target = cfg.target.clone();
+    let verbose = cfg.verbose;
+    let directives = operator_directives(&cfg);
+    let recon_ctx: String = recon.chars().take(3000).collect();
+    let raw: Vec<(String, String, Vec<Finding>)> = stream::iter(selected.iter().cloned())
+        .map(|ag| {
+            let target = target.clone();
+            let recon = recon_ctx.clone();
+            let directives = directives.clone();
+            let txc = tx.clone();
+            async move {
+                if pool.stop_exploiting() { return (ag.name.clone(), String::new(), vec![]); }
+                if verbose { let _ = txc.send(format!("  launching agent: {} ({})", ag.name, ag.title.replace(" Agent", ""))).await; }
+                let user = format!(
+                    "AUTHORIZED container scan of {target}. Proceed and PROVE each issue with the scanner's raw output.\n\n{directives}{tooling}{react}{safety}{body}\n\nReply ONLY a JSON array of confirmed findings (may be []): {{id,title,severity,cwe,endpoint,payload,evidence,impact,remediation,confidence}}.",
+                    target = target, directives = directives, tooling = CONTAINER_TOOLING, react = REACT_DOCTRINE, safety = SAFETY_DOCTRINE,
+                    body = ag.user.replace("{target}", &target).replace("{recon_json}", &recon),
+                );
+                match pool.complete_routed(Task::Exploit, &ag.name, &ag.system, &user).await {
+                    Ok((m, text)) => {
+                        let f = extract_findings(&text, &ag.name);
+                        let _ = txc.send(format!("scan {} via {} -> {} finding(s)", ag.name, m.label(), f.len())).await;
+                        for c in &f { if let Ok(j) = serde_json::to_string(c) { let _ = txc.send(format!("finding_json: {j}")).await; } }
+                        (ag.name.clone(), text, f)
+                    }
+                    Err(e) => { let _ = txc.send(format!("scan {} failed: {e}", ag.name)).await; (ag.name.clone(), format!("ERROR: {e}"), vec![]) }
+                }
+            }
+        })
+        .buffer_unordered(cfg.concurrency)
+        .collect::<Vec<_>>().await;
+
+    let transcript = transcript_of(&raw);
+    let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
+    let _ = tx.send(format!("{} finding(s) (deduped) - validating", candidates.len())).await;
+    let findings = validate(candidates, pool, VOTE_SYS, effective_vote_n(&cfg), &tx).await;
+    finish(cfg, lib, pool, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await
+}
+
+const MOBILE_RECON_SYS: &str = "You are a mobile/binary reverse-engineering recon specialist on an AUTHORIZED assessment of a LOCAL artifact (a binary, APK or IPA on disk). Identify format/arch, package metadata, entry points, protection layers (RASP/anti-tamper, root/JB and anti-debug detection, TLS pinning, obfuscation/packing), the attack surface (exported components, URL schemes, entitlements, linked frameworks) and hardcoded secrets/endpoints. Run everything HEADLESS (MobSF REST/Docker, Ghidra analyzeHeadless, apktool, jadx, otool/nm, r2). Do not ask permission; proceed. Reply with a compact JSON object (format, arch, package, protections, surface, secrets). No prose.";
+
+const MOBILE_TOOLING: &str = "TOOLING (all HEADLESS; provision on demand, time-box installs): APK/IPA static -> MobSF via its REST API (Docker image), `apktool`, `jadx`, `apkleaks`; binaries -> Ghidra `analyzeHeadless`, `radare2`/`rizin`, `binwalk`, `checksec`, `nm`/`otool`/`objdump`, `class-dump`; dynamic -> `frida`/`objection` for detection/pinning/anti-debug bypass; secrets -> `trufflehog`/`gitleaks`. Never require a GUI or an X display. Analyse and instrument non-destructively; never exfiltrate real user data.\n\
+         SAVE ARTIFACTS: write every Frida hook script, bypass script, patched-binary diff, decompiled-snippet PoC and          exploit you produce into $NEUROSPLOIT_POCS (e.g. `<slug>.frida.js`, `<slug>_bypass.js`, `<slug>.py`) with a          header comment saying what it proves and how to run it, and cite the path in the finding's `evidence`, so the          scripts can be retrieved and re-run after the engagement.\n\n";
+
+/// Mobile / binary engagement: analyse a LOCAL artifact (binary, APK or IPA) and
+/// run the mobile RE agents. Mirrors the host pipeline but the target is a file
+/// and the agent set is `mobile`.
+pub async fn run_mobile(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<String>) -> RunOutput {
+    pool.set_progress(tx.clone());
+    let _ = tx.send(format!("MOBILE/BINARY - artifact: {} - {} mobile agents - models: {}", cfg.target, lib.mobile.len(),
+        pool.candidates.iter().map(|m| m.label()).collect::<Vec<_>>().join(", "))).await;
+
+    let recon = if cfg.offline {
+        "{}".to_string()
+    } else {
+        let user = format!("{}{}Artifact path: {}", operator_directives(&cfg), MOBILE_TOOLING, cfg.target);
+        match pool.complete_routed(Task::Recon, "recon", MOBILE_RECON_SYS, &user).await {
+            Ok((m, t)) => { let _ = tx.send(format!("recon complete via {}", m.label())).await; t }
+            Err(e) => { let _ = tx.send(format!("recon failed ({e})")).await; "{}".to_string() }
+        }
+    };
+
+    let mut rl = cfg.rl_path.as_ref().map(|p| RlState::load(Path::new(p))).unwrap_or_default();
+    let mut ranked: Vec<Agent> = lib.mobile.clone();
+    ranked.sort_by(|a, b| rl.weight(&b.name).partial_cmp(&rl.weight(&a.name)).unwrap_or(std::cmp::Ordering::Equal));
+    let cap = if cfg.max_agents > 0 { cfg.max_agents.min(ranked.len()) } else { ranked.len() };
+    let focus = cfg.instructions.clone().unwrap_or_default();
+
+    if cfg.offline {
+        let selected: Vec<Agent> = ranked.into_iter().take(cap).collect();
+        let _ = tx.send(format!("offline: selected {} mobile agent(s); no live analysis", selected.len())).await;
+        let artifacts = persist(&cfg, &recon, "", &[]);
+        return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![],
+            agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon, artifacts, denied: None };
+    }
+
+    let chosen = select_agents(pool, &recon, &focus, &ranked, &tx).await;
+    let selected: Vec<Agent> = if !chosen.is_empty() {
+        let sel: Vec<Agent> = ranked.iter().filter(|a| chosen.iter().any(|c| c == &a.name)).cloned().collect();
+        if sel.is_empty() { ranked.iter().take(cap).cloned().collect() } else { sel.into_iter().take(cap).collect() }
+    } else {
+        ranked.iter().take(cap).cloned().collect()
+    };
+    let selected: Vec<Agent> = { let mut seen = std::collections::HashSet::new();
+        selected.into_iter().filter(|a| seen.insert(a.name.clone())).collect() };
+    let _ = tx.send(format!("selected {} mobile agent(s): {}", selected.len(),
+        selected.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", "))).await;
+
+    let target = cfg.target.clone();
+    let verbose = cfg.verbose;
+    let directives = operator_directives(&cfg);
+    let recon_ctx: String = recon.chars().take(3000).collect();
+    let raw: Vec<(String, String, Vec<Finding>)> = stream::iter(selected.iter().cloned())
+        .map(|ag| {
+            let target = target.clone();
+            let recon = recon_ctx.clone();
+            let directives = directives.clone();
+            let txc = tx.clone();
+            async move {
+                if pool.stop_exploiting() { return (ag.name.clone(), String::new(), vec![]); }
+                if verbose { let _ = txc.send(format!("  launching agent: {} ({})", ag.name, ag.title.replace(" Agent", ""))).await; }
+                let user = format!(
+                    "AUTHORIZED mobile/binary assessment of {target}. Proceed and PROVE each issue from the artifact itself.\n\n{directives}{tooling}{react}{safety}{body}\n\nReply ONLY a JSON array of confirmed findings (may be []): {{id,title,severity,cwe,endpoint,payload,evidence,impact,remediation,confidence}}.",
+                    target = target, directives = directives, tooling = MOBILE_TOOLING, react = REACT_DOCTRINE, safety = SAFETY_DOCTRINE,
+                    body = ag.user.replace("{target}", &target).replace("{recon_json}", &recon),
+                );
+                match pool.complete_routed(Task::Exploit, &ag.name, &ag.system, &user).await {
+                    Ok((m, text)) => {
+                        let f = extract_findings(&text, &ag.name);
+                        let _ = txc.send(format!("test {} via {} -> {} candidate(s)", ag.name, m.label(), f.len())).await;
+                        for c in &f { if let Ok(j) = serde_json::to_string(c) { let _ = txc.send(format!("finding_json: {j}")).await; } }
+                        (ag.name.clone(), text, f)
+                    }
+                    Err(e) => { let _ = txc.send(format!("test {} failed: {e}", ag.name)).await; (ag.name.clone(), format!("ERROR: {e}"), vec![]) }
+                }
+            }
+        })
+        .buffer_unordered(cfg.concurrency)
+        .collect::<Vec<_>>().await;
+
+    let transcript = transcript_of(&raw);
+    let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
+    let _ = tx.send(format!("{} candidate finding(s) (deduped) - validating", candidates.len())).await;
+    let findings = validate(candidates, pool, VOTE_SYS, effective_vote_n(&cfg), &tx).await;
+    let findings = refute_pass(findings, pool, effective_vote_n(&cfg), &tx).await;
+    finish(cfg, lib, pool, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await
+}
+
 const HOST_RECON_SYS: &str = "You are an infrastructure recon specialist on an AUTHORIZED engagement against a HOST/IP. Actively scan with rustscan/nmap (and netexec/smbclient where relevant) to map open ports, services, versions and auth surfaces. Use any provided SSH/Windows credentials to enumerate from inside. Do not ask permission; proceed. Reply with a compact JSON object (host, os, ports, services, auth, ad). No prose.";
 
 const HOST_TOOLING: &str = "TOOLING (best on Kali): nmap/rustscan (ports), netexec/crackmapexec + smbclient (SMB/AD), ssh/sshpass + linpeas (Linux), evil-winrm + winPEAS + impacket (Windows), bloodhound-python/SharpHound (AD), hashcat (offline cracking). Use only supplied credentials; never brute force or run destructive/DoS actions.\n\n";
@@ -1772,7 +3593,7 @@ pub async fn run_host(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sende
         let _ = tx.send(format!("offline: selected {} infra agent(s); no live testing", selected.len())).await;
         let artifacts = persist(&cfg, &recon, "", &[]);
         return RunOutput { target: cfg.target.clone(), workdir: cfg.workdir.clone().unwrap_or_default(), findings: vec![],
-            agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon, artifacts };
+            agents_ran: selected.iter().map(|a| a.name.clone()).collect(), candidates: 0, recon, artifacts, denied: None };
     }
 
     let chosen = select_agents(pool, &recon, &focus, &ranked, &tx).await;
@@ -1828,12 +3649,12 @@ pub async fn run_host(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sende
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} candidate finding(s) (deduped) — validating", candidates.len())).await;
-    let mut findings = validate(candidates, pool, VOTE_SYS, cfg.vote_n, &tx).await;
+    let mut findings = validate(candidates, pool, VOTE_SYS, effective_vote_n(&cfg), &tx).await;
     let chained = attack_chain(pool, &cfg, &recon, &findings, &lib.chains, &tx).await;
     findings.extend(chained);
     findings = dedup_findings(findings);
-    let findings = refute_pass(findings, pool, cfg.vote_n, &tx).await;
-    finish(cfg, lib, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await
+    let findings = refute_pass(findings, pool, effective_vote_n(&cfg), &tx).await;
+    finish(cfg, lib, pool, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await
 }
 
 /// AI-red-team doctrine prepended to every AI/LLM/agent test prompt.
@@ -1907,7 +3728,30 @@ async fn deep_recon(cfg: &RunConfig, pool: &ModelPool, probe_facts: &str, tx: &S
     let doctrine = tool_doctrine(pool.mcp_config.is_some());
     let intensity_dir = recon_intensity_directive(intensity);
     let dir = operator_directives(cfg);
-    let mut accum = format!("OBSERVED HTTP PROBE:\n{probe_facts}");
+    // #15 — the probe facts include content the TARGET controls (titles, body
+    // snippets, headers). Fence it as untrusted data before it enters the
+    // prompt, and flag any prompt-injection the target planted in it.
+    let fenced = crate::taint::sanitize(probe_facts, "http-probe");
+    if fenced.is_suspicious() {
+        // The keyword matcher flags anything mentioning "ignore instructions",
+        // which a legit page can do innocently. When TypeSafe is on, ask a
+        // calibrated Noul whether the content actually tries to steer the agent
+        // before shouting about it. Absent TypeSafe, keep the keyword verdict.
+        let confirmed = match crate::typesafe::TypeSafe::from_env() {
+            Some(ts) if std::env::var("NEUROSPLOIT_TYPESAFE").unwrap_or_default().trim().to_lowercase() != "off" => {
+                ts.is_prompt_injection(&fenced.cleaned, "http-probe").await.map(|p| p >= 0.5).unwrap_or(true)
+            }
+            _ => true,
+        };
+        if confirmed {
+            let _ = tx.send(format!(
+                "notify: 🛑 prompt-injection signal(s) in the target's response neutralised: {}",
+                fenced.signals.iter().map(|x| x.kind.as_str()).collect::<Vec<_>>().join(", ")
+            )).await;
+        }
+    }
+    let mut accum = crate::taint::fence(probe_facts, "http-probe");
+    let _ = &fenced;
     let recon_start = std::time::Instant::now();
     let total_rounds = 1 + extra_rounds;
 
@@ -1993,7 +3837,7 @@ pub async fn run_ai(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<
 
     // Recon the AI endpoint (probe + model recon).
     let recon = if cfg.offline { "{}".to_string() } else {
-        let p = crate::probe::probe(&cfg.target).await;
+        let p = crate::probe::probe_in_scope(&cfg.target, &effective_scope(&cfg)).await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
         let facts = crate::probe::probe_json(&p);
         match pool.complete_routed(Task::Recon, "ai-recon", AI_RECON_SYS,
@@ -2005,7 +3849,7 @@ pub async fn run_ai(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<
     let mut rl = cfg.rl_path.as_ref().map(|p| RlState::load(Path::new(p))).unwrap_or_default();
     if cfg.offline {
         let _ = tx.send("offline: no AI exploitation performed".into()).await;
-        return finish(cfg, lib, recon, String::new(), vec![], agents, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await;
+        return finish(cfg, lib, pool, recon, String::new(), vec![], agents, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await;
     }
     let cap = if cfg.max_agents > 0 { cfg.max_agents.min(agents.len()) } else { agents.len() };
     let selected: Vec<Agent> = agents.into_iter().take(cap).collect();
@@ -2047,12 +3891,12 @@ pub async fn run_ai(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} AI candidate(s) — validating", candidates.len())).await;
-    let mut findings = validate(candidates, pool, VOTE_SYS, cfg.vote_n, &tx).await;
+    let mut findings = validate(candidates, pool, VOTE_SYS, effective_vote_n(&cfg), &tx).await;
     let chained = attack_chain(pool, &cfg, &recon, &findings, &lib.chains, &tx).await;
     findings.extend(chained);
     findings = dedup_findings(findings);
-    let findings = refute_pass(findings, pool, cfg.vote_n, &tx).await;
-    finish(cfg, lib, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await
+    let findings = refute_pass(findings, pool, effective_vote_n(&cfg), &tx).await;
+    finish(cfg, lib, pool, recon, transcript, findings, selected, &mut rl, crate::grounding::GroundMode::Empirical, String::new(), tx).await
 }
 
 /// White-box Skills/plugin audit: read the skill .md file or a folder of them and
@@ -2071,7 +3915,7 @@ pub async fn run_skills_audit(cfg: RunConfig, lib: &Library, pool: &ModelPool, t
     let mut rl = cfg.rl_path.as_ref().map(|p| RlState::load(Path::new(p))).unwrap_or_default();
     if cfg.offline || context.is_empty() {
         let _ = tx.send("offline or empty skills input — nothing audited".into()).await;
-        return finish(cfg, lib, "{}".into(), String::new(), vec![], agents, &mut rl, crate::grounding::GroundMode::Symbolic, String::new(), tx).await;
+        return finish(cfg, lib, pool, "{}".into(), String::new(), vec![], agents, &mut rl, crate::grounding::GroundMode::Symbolic, String::new(), tx).await;
     }
     let directives = operator_directives(&cfg);
     let raw: Vec<(String, String, Vec<Finding>)> = stream::iter(agents.iter().cloned())
@@ -2101,8 +3945,8 @@ pub async fn run_skills_audit(cfg: RunConfig, lib: &Library, pool: &ModelPool, t
         .await;
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
-    let findings = validate(candidates, pool, CODE_VOTE_SYS, cfg.vote_n, &tx).await;
-    finish(cfg, lib, "{}".into(), transcript, findings, agents, &mut rl, crate::grounding::GroundMode::Symbolic, context, tx).await
+    let findings = validate(candidates, pool, CODE_VOTE_SYS, effective_vote_n(&cfg), &tx).await;
+    finish(cfg, lib, pool, "{}".into(), transcript, findings, agents, &mut rl, crate::grounding::GroundMode::Symbolic, context, tx).await
 }
 
 #[cfg(test)]
@@ -2151,5 +3995,243 @@ mod evidence_tests {
         assert_eq!(collect_evidence(&mut miss, &wd), 0);
         assert!(miss[0].screenshots.is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+
+    /// The reply that exposed the bug: prose starting with `[low] …`, then the
+    /// real findings in a fenced block. The naive first-`[`-to-last-`]` span
+    /// began inside the prose and the agent's findings were discarded.
+    #[test]
+    fn narration_before_the_answer_does_not_eat_the_findings() {
+        let text = "[low] Antiforgery cookie missing Secure flag\n\
+                    - Endpoint: https://t.test/Account/Login\n\n\
+                    Final findings:\n\n\
+                    ```json\n[{\"id\":\"c1\",\"title\":\"Cookie without Secure\",\"severity\":\"Low\",\"cwe\":\"CWE-614\"}]\n```\n";
+        let f = extract_findings(text, "oauth_misconfiguration");
+        assert_eq!(f.len(), 1, "the fenced block is the answer");
+        assert_eq!(f[0].title, "Cookie without Secure");
+    }
+
+    #[test]
+    fn a_bare_array_still_works() {
+        let f = extract_findings("[{\"title\":\"X\",\"severity\":\"High\"}]", "a");
+        assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn the_last_fenced_block_wins() {
+        let text = "```json\n[{\"title\":\"draft\"}]\n```\nOn reflection:\n```json\n[{\"title\":\"final\"}]\n```";
+        let f = extract_findings(text, "a");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "final");
+    }
+
+    #[test]
+    fn an_empty_result_is_a_result_not_a_parse_failure() {
+        for t in ["[]", "```json\n[]\n```", "I looked and found nothing.\n\n```json\n[]\n```", "{\"findings\": []}"] {
+            assert!(reported_nothing(t), "{t:?} means 'nothing found'");
+            assert!(extract_findings(t, "a").is_empty());
+        }
+        assert!(!reported_nothing("[{\"title\":\"real\"}]"));
+    }
+
+    #[test]
+    fn a_trailing_comma_is_still_salvaged() {
+        let f = extract_findings("```json\n[{\"title\":\"X\",\"severity\":\"Low\"},]\n```", "a");
+        assert_eq!(f.len(), 1);
+    }
+
+    /// `JSON parse failed` on a live run: single-quoted keys/values and a `//`
+    /// comment — none of which strict serde accepts, all of which json5 does.
+    #[test]
+    fn single_quotes_and_comments_are_recovered() {
+        let f = extract_findings("```json\n[ {'title': 'Reflected XSS', 'severity': 'High'} ] // done\n```", "a");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "Reflected XSS");
+    }
+
+    /// A capitalised fence tag used to fail the old `starts_with('[')` gate and
+    /// surface as `no JSON array/object found`.
+    #[test]
+    fn a_capitalised_fence_tag_is_handled() {
+        let f = extract_findings("```JSON\n[{\"title\":\"Open redirect\",\"severity\":\"Medium\"}]\n```", "a");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "Open redirect");
+    }
+
+    /// Token-limit truncation mid-way through the third finding: the two complete
+    /// ones must survive instead of the whole batch being discarded.
+    #[test]
+    fn a_truncated_array_keeps_the_complete_findings() {
+        let text = "[{\"title\":\"A\",\"severity\":\"Low\"},{\"title\":\"B\",\"severity\":\"Low\"},{\"title\":\"C";
+        let f = extract_findings(text, "a");
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[1].title, "B");
+    }
+
+    /// Pure prose (a refusal or narration with no JSON) is not a finding and not
+    /// a parse error — it yields nothing.
+    #[test]
+    fn pure_prose_yields_no_findings() {
+        assert!(extract_findings("I could not identify any injectable parameters.", "a").is_empty());
+    }
+
+    /// Black-box models often ignore "reply with ONLY a JSON array" and wrap the
+    /// batch in `{"findings":[…]}`. That object has no `title`, so the old
+    /// object-as-one-finding path dropped it and reported "0 parseable findings"
+    /// while real findings were lost. It must now unwrap to its array.
+    #[test]
+    fn a_findings_wrapper_object_is_unwrapped() {
+        let text = "```json\n{\"findings\":[{\"title\":\"IDOR on /orders\",\"severity\":\"High\"},{\"title\":\"Reflected XSS\",\"severity\":\"Medium\"}]}\n```";
+        let f = extract_findings(text, "a");
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].title, "IDOR on /orders");
+    }
+
+    /// Alternate wrapper keys models use for the same shape.
+    #[test]
+    fn a_vulnerabilities_wrapper_object_is_unwrapped() {
+        let f = extract_findings("{\"vulnerabilities\":[{\"title\":\"SQLi\",\"severity\":\"Critical\"}]}", "a");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "SQLi");
+    }
+
+    /// A single bare finding object (with its own `title`) is still one finding —
+    /// unwrapping must not steal a nested array it happens to carry.
+    #[test]
+    fn a_bare_finding_object_stays_one_finding() {
+        let f = extract_findings("{\"title\":\"Open redirect\",\"severity\":\"Low\",\"repro_steps\":[\"curl …\"]}", "a");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "Open redirect");
+    }
+
+    /// An empty wrapper is an honest negative, not a malformed reply.
+    #[test]
+    fn an_empty_wrapper_is_reported_nothing_not_a_parse_failure() {
+        assert!(reported_nothing("{\"findings\":[]}"));
+        assert!(reported_nothing("```json\n{\"vulnerabilities\": []}\n```"));
+        assert!(extract_findings("{\"findings\":[]}", "a").is_empty());
+    }
+
+    /// The bare-array happy path for agent selection.
+    #[test]
+    fn a_string_array_parses_plain() {
+        assert_eq!(parse_string_array("[\"sqli\",\"xss\"]"), vec!["sqli", "xss"]);
+    }
+
+    /// Same wrapper-object deviation as findings: `{"agents":[…]}` must not read as
+    /// an empty selection (which silently drops the model's choice to RL ranking).
+    #[test]
+    fn a_wrapped_string_array_is_unwrapped() {
+        assert_eq!(parse_string_array("{\"agents\":[\"sqli\",\"idor\"]}"), vec!["sqli", "idor"]);
+        assert_eq!(parse_string_array("```json\n{\"selected\": [\"ssrf\"]}\n```"), vec!["ssrf"]);
+    }
+
+    /// Models sometimes answer with objects per element instead of bare strings.
+    #[test]
+    fn array_elements_that_are_objects_yield_their_name() {
+        assert_eq!(
+            parse_string_array("[{\"name\":\"sqli\",\"why\":\"x\"},{\"agent\":\"xss\"}]"),
+            vec!["sqli", "xss"]
+        );
+    }
+
+    /// A chain reply wrapping findings under a non-`findings` key still yields both
+    /// the findings and the sibling loot.
+    #[test]
+    fn extract_chain_unwraps_any_findings_key_with_loot() {
+        let text = "{\"vulnerabilities\":[{\"title\":\"RCE\",\"severity\":\"Critical\"}],\"loot\":[\"root creds\"]}";
+        let (f, loot) = extract_chain(text, "chain");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "RCE");
+        assert_eq!(loot, vec!["root creds"]);
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn f(agent: &str, title: &str, cwe: &str, endpoint: &str, sev: &str) -> Finding {
+        Finding {
+            agent: agent.into(),
+            title: title.into(),
+            cwe: cwe.into(),
+            endpoint: endpoint.into(),
+            severity: sev.into(),
+            confidence: 0.8,
+            ..Default::default()
+        }
+    }
+
+    /// The five reports of one cookie issue from a live engagement — different
+    /// agents, different CWE spellings, different endpoint decorations,
+    /// different severities.
+    #[test]
+    fn one_issue_reported_by_five_agents_becomes_one_finding() {
+        let v = vec![
+            f("cleartext_transmission", "Antiforgery cookie set without Secure flag (transmittable over cleartext HTTP)", "CWE-614", "https://h.test/ (any page; e.g. /Account/Login, /Account/Register)", "Low"),
+            f("account_takeover_chain", "Antiforgery cookie set without Secure flag + no HSTS on identity flows", "CWE-614", "https://h.test/Account/Login", "Low"),
+            f("insecure_cookie_flags", "Antiforgery (CSRF-token) cookie set over HTTPS without the Secure flag", "CWE-614", "https://h.test/ (also /Account/Login, /Account/Register)", "Medium"),
+            f("account_registration_and_forms", "Antiforgery cookie set without Secure flag over HTTPS", "CWE-614 (Sensitive Cookie in HTTPS Session Without Secure Attribute)", "GET https://h.test/ (and /Account/Register, /Account/Login)", "Low"),
+        ];
+        let out = dedup_findings(v);
+        let cookie: Vec<&Finding> = out.iter().filter(|x| cwe_num(&x.cwe) == "614" && endpoint_key(&x.endpoint) == "h.test").collect();
+        assert_eq!(cookie.len(), 1, "got {:?}", out.iter().map(|x| (&x.agent, &x.title)).collect::<Vec<_>>());
+        // Severity must not drift down just because most agents said Low.
+        assert_eq!(cookie[0].severity, "Medium");
+        assert!(cookie[0].votes.contains("corroborated by"), "agreement belongs in the report: {:?}", cookie[0].votes);
+    }
+
+    /// Three different missing headers are all CWE-693 on `/` and are three
+    /// separate fixes — merging by (cwe, endpoint) alone would erase two.
+    #[test]
+    fn different_headers_under_one_cwe_stay_separate() {
+        let v = vec![
+            f("security_headers", "Missing X-Content-Type-Options: nosniff", "CWE-693", "https://h.test/", "Low"),
+            f("security_headers", "Missing Referrer-Policy header", "CWE-693", "https://h.test/", "Low"),
+            f("security_headers", "Missing Permissions-Policy header", "CWE-693", "https://h.test/", "Low"),
+            f("security_headers", "Weak Content-Security-Policy — only frame-ancestors defined, no script-src/default-src", "CWE-693", "https://h.test/", "Low"),
+        ];
+        assert_eq!(dedup_findings(v).len(), 4);
+    }
+
+    /// Same CWE, same host, different endpoints: three real findings with
+    /// different impact (login spraying vs reset-email flooding).
+    #[test]
+    fn the_same_weakness_on_different_endpoints_is_not_a_duplicate() {
+        let v = vec![
+            f("rate_limit_abuse", "Missing rate limiting & account lockout on login", "CWE-307", "https://h.test/Account/Login", "Medium"),
+            f("rate_limit_abuse", "Missing rate limiting on password-reset flow", "CWE-307", "https://h.test/Account/ForgotPassword", "Medium"),
+            f("rate_limit_abuse", "Missing rate limiting on resend-email-confirmation", "CWE-307", "https://h.test/Account/ResendEmailConfirmation", "Medium"),
+        ];
+        assert_eq!(dedup_findings(v).len(), 3);
+    }
+
+    #[test]
+    fn the_survivor_keeps_the_fullest_evidence_and_the_missing_pieces() {
+        let mut thin = f("a", "Missing HSTS header", "CWE-319", "https://h.test/", "Medium");
+        thin.evidence = "short".into();
+        let mut rich = f("b", "Missing HTTP Strict-Transport-Security (HSTS) header", "CWE-319", "https://h.test/", "Low");
+        rich.evidence = "a much longer evidence blob with the full header dump".into();
+        rich.remediation = "Add Strict-Transport-Security with max-age".into();
+        let out = dedup_findings(vec![thin, rich]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, "Medium", "highest severity wins");
+        assert!(out[0].evidence.contains("full header dump"), "fullest evidence wins");
+        assert!(!out[0].remediation.is_empty(), "the duplicate's remediation is not lost");
+    }
+
+    #[test]
+    fn endpoint_and_cwe_are_normalized_the_same_however_they_were_written() {
+        assert_eq!(cwe_num("CWE-614 (Sensitive Cookie…)"), "614");
+        assert_eq!(cwe_num("CWE-204 (Observable Response Discrepancy) / CWE-200"), "204");
+        assert_eq!(endpoint_key("GET https://h.test/ (and /Account/Register)"), "h.test");
+        assert_eq!(endpoint_key("https://h.test/Account/Login?x=1"), "h.test/account/login");
+        assert_eq!(endpoint_key("https://www.h.test/a/"), "h.test/a");
     }
 }

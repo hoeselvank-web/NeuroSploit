@@ -55,6 +55,45 @@ fn esc(s: &str) -> String {
 /// grid, and a vulnerability summary table. No attack-path/kill-chain
 /// section — that lives in the interactive web console's live graph instead.
 pub fn html(target: &str, findings: &[Finding], meta: &EngagementMeta) -> String {
+    html_with_pocs(target, findings, meta, &[])
+}
+
+/// As [`html`], but told which scripts exist in the run's `pocs/` directory so
+/// each finding can link the ones it cites.
+/// Render a compliance-mapping section (one table per framework) and splice it
+/// into a finished report just before `</body>`. Kept separate from
+/// `html_with_pocs` so the base report has no notion of compliance and callers
+/// opt in only when frameworks were requested.
+pub fn with_compliance(html: String, findings: &[Finding], frameworks: &[String]) -> String {
+    let mut section = String::new();
+    for name in frameworks {
+        let Some(fw) = crate::compliance::Framework::parse(name) else { continue };
+        let r = crate::compliance::map_findings(findings, fw, true);
+        section.push_str(&format!(
+            "<h2>Compliance — {}</h2><p class=m style=\"font-style:italic\">{}</p>",
+            esc(&r.framework_title), esc(&r.disclaimer())
+        ));
+        if r.controls_with_gaps.is_empty() {
+            section.push_str("<p>No confirmed finding mapped to a control in this framework. This is not evidence of compliance — only that this engagement found no gap here.</p>");
+            continue;
+        }
+        section.push_str("<table class=fieldgrid><tr><th>Control</th><th>Requirement</th><th>Severity</th><th>Findings</th></tr>");
+        for g in &r.controls_with_gaps {
+            section.push_str(&format!(
+                "<tr><td><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&g.control.id), esc(&g.control.requirement), esc(&g.max_severity), g.finding_ids.len()
+            ));
+        }
+        section.push_str("</table>");
+    }
+    if section.is_empty() {
+        return html;
+    }
+    html.replacen("<p class=footer>", &format!("{section}<p class=footer>"), 1)
+}
+
+pub fn html_with_pocs(target: &str, findings: &[Finding], meta: &EngagementMeta, available_pocs: &[String]) -> String {
+    let available_pocs = available_pocs.to_vec();
     let mut sorted = findings.to_vec();
     sorted.sort_by_key(|f| sev_rank(&f.severity));
 
@@ -103,15 +142,42 @@ pub fn html(target: &str, findings: &[Finding], meta: &EngagementMeta) -> String
                    <tr><td class=fk>Agent</td><td>{agent}</td>{authcell}</tr>\
                  </table>\
                  {reviewnote}\
-                 <h4>Description / Impact</h4><p>{impact}</p>\
-                 <h4>Proof of Concept</h4><pre>{payload}</pre>\
-                 <h4>Evidence</h4><pre>{evidence}</pre>{shots}\
-                 <h4>Remediation</h4><p>{remediation}</p></section>",
+                 <h4>Where the problem is</h4><p class=where>{where_}</p>\
+                 <h4>What it means</h4><p>{impact}</p>\
+                 <h4>How to fix it</h4><p>{remediation}</p>\
+                 <h4>Proof of concept — step by step</h4>{steps}\
+                 {payloadblock}\
+                 <h4>Technical evidence</h4><pre>{evidence}</pre>{shots}\
+                 {scripts}</section>",
                 sevc = sev_color(&f.severity), sev = esc(&f.severity), i = i + 1, title = esc(&f.title),
                 agent = esc(&f.agent),
                 owaspcwe = [esc(&f.owasp), esc(&f.cwe)].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · "),
                 confline = if f.votes.is_empty() { format!("conf {:.2}", f.confidence) } else { format!("{} · conf {:.2}", esc(&f.votes), f.confidence) },
-                endpoint = esc(&f.endpoint), payload = esc(&f.payload), evidence = esc(&f.evidence),
+                endpoint = esc(&f.endpoint),
+                where_ = esc(&location_line(f)),
+                steps = {
+                    // Numbered, pasteable commands. A reader who cannot
+                    // reproduce a finding has to take it on faith, and a report
+                    // that must be believed is worth less than one that can be
+                    // checked.
+                    let items: String = repro_steps(f).iter()
+                        .map(|st| format!("<li><pre class=step>{}</pre></li>", esc(st)))
+                        .collect();
+                    format!("<ol class=steps>{items}</ol>")
+                },
+                payloadblock = if f.payload.trim().is_empty() { String::new() } else {
+                    format!("<h4>Payload</h4><pre class=payload>{}</pre>", esc(f.payload.trim()))
+                },
+                scripts = {
+                    let names = poc_scripts(f, &available_pocs);
+                    if names.is_empty() { String::new() } else {
+                        let items: String = names.iter()
+                            .map(|n| format!("<li><a href=\"pocs/{n}\"><code>pocs/{n}</code></a></li>", n = esc(n)))
+                            .collect();
+                        format!("<h4>Runnable script (extra)</h4><p class=hint>The steps above are the proof; this script automates them.</p><ul class=pocs>{items}</ul>")
+                    }
+                },
+                evidence = esc(&technical_evidence(f)),
                 impact = esc(&f.impact), remediation = esc(&f.remediation),
                 status = if needs_review(f) { "<span style=color:#8e44ad>needs-review</span>" } else { "<span style=color:#27ae60>confirmed</span>" },
                 shots = if f.screenshots.is_empty() { String::new() } else {
@@ -176,8 +242,11 @@ pub fn html(target: &str, findings: &[Finding], meta: &EngagementMeta) -> String
          <h2>Executive Summary</h2><div class=summary-grid>{summary_grid}</div>\
          {vuln_summary}\
          <h2>Findings ({n})</h2>{body}\
-         <p class=footer>Authorized testing only. Confirmed findings passed multi-model voting, receipt grounding and adversarial refute; \"needs-review\" are flagged for a human.<br>NeuroSploit v4.0.0 · by <b>Joas A Santos</b> &amp; <b>Red Team Leaders</b></p></body></html>",
+         <p class=footer>Authorized testing only. Confirmed findings passed multi-model voting, receipt grounding and adversarial refute; \"needs-review\" are flagged for a human.<br>NeuroSploit v4.2.0 · by <b>Joas A Santos</b> &amp; <b>Red Team Leaders</b><br><span style=\"font-family:ui-monospace,monospace\">{provenance}</span></p></body></html>",
         t = esc(target), n = sorted.len(), body = body, summary_grid = summary_grid, vuln_summary = vuln_summary,
+        // Which build produced this document. A report that circulates without
+        // it is a report nobody can trace back to the run that made it.
+        provenance = esc(&crate::provenance::Provenance::process().tag()),
         asset = esc(if meta.asset.is_empty() { "unidentified web asset" } else { &meta.asset }),
         techrow = if meta.tech.is_empty() { String::new() } else { format!("<tr><td>Technology</td><td>{}</td></tr>", esc(&meta.tech.join(", "))) },
         serverrow = if meta.server.is_empty() { String::new() } else { format!("<tr><td>Server</td><td>{}</td></tr>", esc(&meta.server)) },
@@ -185,6 +254,232 @@ pub fn html(target: &str, findings: &[Finding], meta: &EngagementMeta) -> String
 }
 
 // ===== Typst report =====
+
+// ---------------------------------------------------------------------------
+// Proof of concept & technical evidence
+//
+// A finding is only useful if the reader can (a) find the problem, (b) see why
+// it matters, (c) fix it, and (d) reproduce it without trusting us. The report
+// used to print a payload blob and an evidence blob, which serves (d) badly and
+// the rest not at all: "payload: ' OR 1=1--" tells a developer nothing about
+// WHERE to look, and a PoC script attached as a file is a black box unless you
+// run it.
+//
+// So the PoC is rendered as steps a person can paste, with the script offered
+// as an extra artifact rather than as the proof itself.
+// ---------------------------------------------------------------------------
+
+/// Where the problem is, in one line, as precisely as the finding allows.
+pub fn location_line(f: &Finding) -> String {
+    match (f.location.trim(), f.endpoint.trim()) {
+        ("", "") => "(location not recorded)".into(),
+        ("", ep) => ep.to_string(),
+        (loc, "") => loc.to_string(),
+        (loc, ep) if loc.contains(ep) => loc.to_string(),
+        (loc, ep) => format!("{ep} — {loc}"),
+    }
+}
+
+/// A curl command that reproduces the request, built from the structured
+/// evidence when the agent recorded it and from the endpoint/payload otherwise.
+pub fn curl_command(f: &Finding) -> String {
+    if let Some(ev) = &f.evidence_data {
+        if let Some(a) = &ev.attack {
+            let mut cmd = String::from("curl -i -s");
+            let method = a.method.to_uppercase();
+            if !method.is_empty() && method != "GET" {
+                cmd.push_str(&format!(" -X {method}"));
+            }
+            for (k, v) in &a.request_headers {
+                // Never print a real credential into a document that gets
+                // shared; the reader substitutes their own.
+                let val = if is_secret_header(k) { "<redacted — use your own>" } else { v.as_str() };
+                cmd.push_str(&format!(" \\\n  -H '{k}: {val}'"));
+            }
+            if !f.payload.trim().is_empty() && method != "GET" {
+                cmd.push_str(&format!(" \\\n  --data-raw '{}'", f.payload.replace('\'', "'\\''")));
+            }
+            cmd.push_str(&format!(" \\\n  '{}'", a.url));
+            return cmd;
+        }
+    }
+    if f.endpoint.trim().is_empty() {
+        return String::new();
+    }
+    format!("curl -i -s '{}'", f.endpoint.trim())
+}
+
+fn is_secret_header(k: &str) -> bool {
+    let k = k.to_lowercase();
+    k == "authorization" || k == "cookie" || k == "x-api-key" || k.contains("token") || k.contains("secret")
+}
+
+/// Ordered reproduction steps. Uses what the agent recorded; falls back to a
+/// minimal derived sequence so every finding carries something runnable.
+pub fn repro_steps(f: &Finding) -> Vec<String> {
+    if !f.repro_steps.is_empty() {
+        return f.repro_steps.clone();
+    }
+    let mut steps = Vec::new();
+    let curl = curl_command(f);
+    if let Some(ev) = &f.evidence_data {
+        if let Some(b) = &ev.baseline {
+            steps.push(format!("Baseline — request the same resource without the payload:\ncurl -i -s '{}'", b.url));
+        }
+        if ev.identity_a.is_some() && ev.identity_b.is_some() {
+            let a = ev.identity_a.as_ref().unwrap();
+            let b = ev.identity_b.as_ref().unwrap();
+            steps.push(format!("As {}: curl -i -s '{}'", if a.identity.is_empty() { "the owner" } else { &a.identity }, a.url));
+            steps.push(format!("As {}: request the SAME resource:\ncurl -i -s '{}'", if b.identity.is_empty() { "the other identity" } else { &b.identity }, b.url));
+            steps.push("Compare the two bodies — the second returning the first's data is the finding.".into());
+            return steps;
+        }
+    }
+    if !curl.is_empty() {
+        steps.push(format!("Send the request carrying the payload:\n{curl}"));
+    }
+    if !f.payload.trim().is_empty() {
+        steps.push(format!("Payload used:\n{}", f.payload.trim()));
+    }
+    if steps.is_empty() {
+        steps.push("No reproduction steps were recorded for this finding.".into());
+    }
+    steps
+}
+
+/// The detailed technical evidence: the measured difference between baseline
+/// and attack, then the raw exchanges. This is what turns "it returned a 500"
+/// into something a reviewer can check.
+pub fn technical_evidence(f: &Finding) -> String {
+    let mut out = String::new();
+    if let Some(ev) = &f.evidence_data {
+        if let (Some(b), Some(a)) = (&ev.baseline, &ev.attack) {
+            let d = crate::validation::diff(b, a);
+            out.push_str(&format!(
+                "MEASURED DIFFERENCE\n  baseline : {} {} · {} bytes · {} ms\n  attack   : {} {} · {} bytes · {} ms\n  delta    : {}\n",
+                b.status, b.url, b.len(), b.elapsed_ms,
+                a.status, a.url, a.len(), a.elapsed_ms,
+                d.describe()
+            ));
+            if !ev.repeats.is_empty() {
+                let (ok, hits) = crate::validation::reproducible(b, &ev.repeats, 2);
+                out.push_str(&format!(
+                    "  repeats  : {hits}/{} reproduced the same difference{}\n",
+                    ev.repeats.len(),
+                    if ok { "" } else { " — NOT deterministic" }
+                ));
+            }
+            out.push('\n');
+        }
+        if !ev.marker.is_empty() {
+            out.push_str(&format!(
+                "CONTROLLED MARKER\n  {} — observed: {}{}{}\n\n",
+                ev.marker,
+                if ev.marker_observed { "yes" } else { "no" },
+                if ev.browser_executed { " · executed in a real browser" } else { "" },
+                if ev.callback_received { " · out-of-band callback received" } else { "" },
+            ));
+        }
+        for (label, x) in [("BASELINE", &ev.baseline), ("ATTACK", &ev.attack), ("AS OWNER", &ev.identity_a), ("AS OTHER IDENTITY", &ev.identity_b)] {
+            if let Some(x) = x {
+                out.push_str(&render_exchange(label, x));
+            }
+        }
+    }
+    if !f.evidence.trim().is_empty() {
+        out.push_str("AGENT-RECORDED EVIDENCE\n");
+        out.push_str(f.evidence.trim());
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn render_exchange(label: &str, x: &crate::validation::Exchange) -> String {
+    let mut s = format!("{label}\n  {} {} → {}\n", if x.method.is_empty() { "GET" } else { &x.method }, x.url, x.status);
+    if !x.identity.is_empty() {
+        s.push_str(&format!("  identity: {}\n", x.identity));
+    }
+    for k in ["location", "set-cookie", "content-type", "access-control-allow-origin", "access-control-allow-credentials", "x-frame-options", "content-security-policy", "retry-after"] {
+        let v = x.header(k);
+        if !v.is_empty() {
+            s.push_str(&format!("  {k}: {}\n", clip(v, 200)));
+        }
+    }
+    if !x.body.trim().is_empty() {
+        s.push_str(&format!("  body ({} bytes, excerpt):\n{}\n", x.len(), indent(&clip(x.body.trim(), 1200), "    ")));
+    }
+    s.push('\n');
+    s
+}
+
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(n).collect();
+    format!("{cut}…")
+}
+
+fn indent(s: &str, pad: &str) -> String {
+    s.lines().map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n")
+}
+
+/// PoC scripts this finding cites, or that the run wrote. The script is an
+/// extra artifact — the steps above are the proof.
+pub fn poc_scripts(f: &Finding, available: &[String]) -> Vec<String> {
+    let cited = format!("{} {} {}", f.evidence, f.payload, f.repro_steps.join(" "));
+    let matches: Vec<String> = available.iter().filter(|p| cited.contains(p.as_str())).cloned().collect();
+    matches
+}
+
+/// Insert zero-width break opportunities into text that would otherwise
+/// overflow the page.
+///
+/// Typst's `raw` does not wrap, so a 300-character URL-encoded POST body ran
+/// off the page edge. The first attempt at a fix was worse: it inserted breaks
+/// every N characters regardless of context, which chopped ordinary prose
+/// mid-word — "rota ted", "lockoutOnFailu re=false". Evidence text is usually
+/// prose with a few long machine tokens embedded in it.
+///
+/// So the rule is per token: anything that fits on a line is left exactly as
+/// it is, and only a token too long to fit gets internal break points. A
+/// zero-width space carries no width and no content, so copying the text back
+/// out yields the original either way.
+pub fn wrappable(s: &str) -> String {
+    const ZWSP: char = '\u{200b}';
+    // Roughly the character budget of one line in the report's 7.5pt mono at
+    // the page width. Prose words never reach it; encoded payloads always do.
+    const LONG: usize = 46;
+    const AFTER: &[char] = &['&', '?', '/', '=', ';', ',', '+', '%', '|'];
+
+    let mut out = String::with_capacity(s.len() + s.len() / 16);
+    for chunk in s.split_inclusive(char::is_whitespace) {
+        let (token, trailing) = match chunk.find(char::is_whitespace) {
+            Some(i) => (&chunk[..i], &chunk[i..]),
+            None => (chunk, ""),
+        };
+        if token.chars().count() <= LONG {
+            out.push_str(token);
+        } else {
+            let mut run = 0usize;
+            for ch in token.chars() {
+                out.push(ch);
+                run += 1;
+                if AFTER.contains(&ch) {
+                    out.push(ZWSP);
+                    run = 0;
+                } else if run >= LONG - 6 {
+                    // A base64 blob or a hash has no separators at all; break it
+                    // rather than let it push the margin.
+                    out.push(ZWSP);
+                    run = 0;
+                }
+            }
+        }
+        out.push_str(trailing);
+    }
+    out
+}
 
 /// Is the `typst` binary available on PATH?
 fn typst_available() -> bool {
@@ -222,12 +517,13 @@ pub fn typst_report(target: &str, findings: &[Finding], dir: &Path) -> std::io::
 
     let mut data = String::new();
     data.push_str(&format!(
-        "#let meta = (target: {}, asset: {}, tech: {}, server: {}, run_id: {}, generated: {}, model: {}, exec: {}, conclusion: {}, accounts: {})\n",
+        "#let meta = (target: {}, asset: {}, tech: {}, server: {}, run_id: {}, generated: {}, model: {}, exec: {}, conclusion: {}, accounts: {}, provenance: {})\n",
         tq(target), tq(&asset), tq(&meta.tech.join(", ")), tq(&meta.server),
         tq(&run_id), tq("July 2026"), tq("multi-model"),
         tq(&strip_md(&exec_summary(target, &meta, &confirmed, &review))),
         tq(&strip_md(&conclusion(target, &meta, &confirmed, &review))),
         tq(&strip_md(&accounts)),
+        tq(&crate::provenance::Provenance::process().tag()),
     ));
     data.push_str("#let findings = (\n");
     for f in &sorted {
@@ -235,13 +531,21 @@ pub fn typst_report(target: &str, findings: &[Finding], dir: &Path) -> std::io::
         let status = if needs_review(f) { "needs-review" } else { "confirmed" };
         let shots = format!("({})",
             f.screenshots.iter().map(|p| format!("{},", tq(p))).collect::<String>());
+        // Steps go as an ARRAY so the template can render a real numbered
+        // list. Flattening them into one string is what produced the run-on
+        // paragraph in the last report, where five separate commands ran
+        // together as prose.
+        let steps = format!("({})",
+            repro_steps(f).iter().map(|st| format!("{},", tq(&wrappable(st)))).collect::<String>());
         data.push_str(&format!(
-            "  (severity: {}, title: {}, agent: {}, cwe: {}, owasp: {}, cvss: {}, endpoint: {}, payload: {}, evidence: {}, impact: {}, remediation: {}, votes: {}, confidence: {}, status: {}, auth: {}, screenshots: {}),\n",
+            "  (severity: {}, title: {}, agent: {}, cwe: {}, owasp: {}, cvss: {}, endpoint: {}, payload: {}, evidence: {}, impact: {}, remediation: {}, votes: {}, confidence: {}, status: {}, auth: {}, screenshots: {}, location: {}, steps: {}),\n",
             tq(&f.severity), tq(&f.title), tq(&f.agent), tq(&f.cwe), tq(&owasp), tq(&f.cvss),
-            tq(&f.endpoint), tq(&f.payload), tq(&f.evidence), tq(&f.impact),
+            tq(&f.endpoint), tq(&wrappable(&f.payload)), tq(&wrappable(&technical_evidence(f))), tq(&f.impact),
             tq(&f.remediation), tq(&f.votes), f.confidence, tq(status),
             tq(if f.auth_context.is_empty() { "-" } else { &f.auth_context }),
             shots,
+            tq(&location_line(f)),
+            steps,
         ));
     }
     data.push_str(")\n\n");
@@ -325,15 +629,26 @@ pub fn markdown(target: &str, findings: &[Finding], meta: &EngagementMeta) -> St
         if needs_review(f) && !f.review_reason.is_empty() {
             s.push_str(&format!("> ⚠️ **Needs human review** — {}\n\n", f.review_reason));
         }
-        if !f.endpoint.is_empty() { s.push_str(&format!("**Endpoint:** `{}`\n\n", f.endpoint)); }
-        if !f.payload.is_empty() { s.push_str(&format!("**Payload**\n```\n{}\n```\n\n", f.payload)); }
-        if !f.evidence.is_empty() { s.push_str(&format!("**Evidence**\n```\n{}\n```\n\n", f.evidence)); }
+        // Order follows how a reader works through a finding: where it is, what
+        // it means, how to fix it, then how to see it for themselves.
+        s.push_str(&format!("**Where the problem is:** {}\n\n", location_line(f)));
+        if !f.impact.is_empty() { s.push_str(&format!("**What it means:** {}\n\n", f.impact)); }
+        if !f.remediation.is_empty() { s.push_str(&format!("**How to fix it:** {}\n\n", f.remediation)); }
+        let steps = repro_steps(f);
+        if !steps.is_empty() {
+            s.push_str("**Proof of concept — step by step**\n\n");
+            for (n, st) in steps.iter().enumerate() {
+                s.push_str(&format!("{}. ```\n{}\n```\n", n + 1, st));
+            }
+            s.push('\n');
+        }
+        if !f.payload.trim().is_empty() { s.push_str(&format!("**Payload**\n```\n{}\n```\n\n", f.payload.trim())); }
+        let tech = technical_evidence(f);
+        if !tech.is_empty() { s.push_str(&format!("**Technical evidence**\n```\n{}\n```\n\n", tech)); }
         if !f.screenshots.is_empty() {
             s.push_str("**Proof screenshots**\n\n");
             for p in &f.screenshots { s.push_str(&format!("![{}]({})\n\n", f.title.replace(']', ")"), p)); }
         }
-        if !f.impact.is_empty() { s.push_str(&format!("**Impact:** {}\n\n", f.impact)); }
-        if !f.remediation.is_empty() { s.push_str(&format!("**Remediation:** {}\n\n", f.remediation)); }
         s.push_str("---\n\n");
         s
     };
@@ -495,8 +810,49 @@ pub fn write_all(target: &str, findings: &[Finding], dir: &Path) -> std::io::Res
     md.push_str(&pocs_section(dir));
     std::fs::write(dir.join("report.md"), md)?;
     std::fs::write(dir.join("report.json"), json_report(target, findings, &run_id, &meta))?;
-    std::fs::write(dir.join("report.html"), html(target, findings, &meta))?;
+    std::fs::write(dir.join("report.sarif"), crate::sarif::to_string(target, findings))?;
+    let pocs: Vec<String> = std::fs::read_dir(dir.join("pocs"))
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+        .unwrap_or_default();
+    std::fs::write(dir.join("report.html"), html_with_pocs(target, findings, &meta, &pocs))?;
     typst_report(target, findings, dir)
+}
+
+/// Rebuild every report artifact for a finished run, reading its own
+/// `findings.json`.
+///
+/// The web console needs this: a PDF is only produced at run time, and when
+/// `typst` was missing then (or the report template improved since), the
+/// operator has no way to get one without re-running the engagement. This
+/// regenerates from the evidence already on disk.
+pub fn rebuild(dir: &Path) -> std::io::Result<PathBuf> {
+    let mut findings: Vec<Finding> = std::fs::read_to_string(dir.join("findings.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    // Re-enrich on rebuild: a run finished before a mapping existed (CVSS, a
+    // new CWE→technique entry) would otherwise keep reprinting the gap forever,
+    // and the whole point of rebuilding is to get the current report.
+    crate::attack_graph::enrich(&mut findings);
+    // A rebuild applies the CURRENT mappings, including ones that did not exist
+    // when the run finished.
+    crate::attack_graph::remap_stages(&mut findings);
+    crate::chain::repair(&mut findings);
+    crate::chain::apply_links(&mut findings);
+    let _ = std::fs::write(dir.join("findings.json"), serde_json::to_string_pretty(&findings).unwrap_or_default());
+    let status: serde_json::Value = std::fs::read_to_string(dir.join("status.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let meta = read_meta(dir);
+    let target = status
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| if meta.target.is_empty() { None } else { Some(meta.target.clone()) })
+        .unwrap_or_else(|| dir.file_name().and_then(|s| s.to_str()).unwrap_or("target").to_string());
+    write_all(&target, &findings, dir)
 }
 
 #[cfg(test)]
@@ -523,5 +879,50 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&js).unwrap();
         assert_eq!(v["summary"]["needs_review"], 1);
         assert_eq!(v["summary"]["confirmed"], 0);
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+    const ZWSP: char = '\u{200b}';
+
+    /// The regression: evidence is prose with machine tokens in it, and the
+    /// first implementation broke the prose.
+    #[test]
+    fn ordinary_words_are_never_split() {
+        let prose = "token not rotated/consumed, so ASP.NET Core Identity configured with lockoutOnFailure=false";
+        let out = wrappable(prose);
+        assert!(!out.contains(ZWSP), "no word here is long enough to need breaking: {out:?}");
+        assert_eq!(out, prose);
+    }
+
+    #[test]
+    fn a_long_encoded_payload_gets_break_points() {
+        let payload = "Input.Nome=poc&Input.Email=victim@example.test&Input.Password=NrSplt!Test123&Input.ConfirmPassword=NrSplt!Test123&__RequestVerificationToken=CfDJ8A0uCaR&_handler=register";
+        let out = wrappable(payload);
+        assert!(out.contains(ZWSP), "a 170-character token must be breakable");
+        // The text itself is unchanged once the invisible marks are removed.
+        assert_eq!(out.replace(ZWSP, ""), payload);
+    }
+
+    #[test]
+    fn an_unbroken_blob_is_still_breakable() {
+        let blob = "A".repeat(200);
+        let out = wrappable(&blob);
+        assert!(out.contains(ZWSP), "a base64 blob has no separators and still must wrap");
+        assert_eq!(out.replace(ZWSP, ""), blob);
+    }
+
+    #[test]
+    fn whitespace_and_newlines_survive_untouched() {
+        let s = "line one\n  indented two\ttabbed";
+        assert_eq!(wrappable(s), s);
+    }
+
+    #[test]
+    fn a_url_just_under_the_limit_is_left_alone() {
+        let url = "https://arenahockeypara.com.br/Account/Login";
+        assert_eq!(wrappable(url), url, "a normal URL fits and must not be peppered with breaks");
     }
 }

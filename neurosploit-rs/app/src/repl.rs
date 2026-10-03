@@ -1,4 +1,4 @@
-//! NeuroSploit v4.0.0 — interactive session (Claude-Code / Codex / Cursor-CLI style).
+//! NeuroSploit v4.2.0 — interactive session (Claude-Code / Codex / Cursor-CLI style).
 //!
 //! Launched when `neurosploit` runs with no subcommand. A persistent REPL with
 //! real line editing (arrow-key history recall, Ctrl-A/E/K, paste), model
@@ -139,12 +139,34 @@ struct LiveCheckpoint {
     commands: Vec<String>,
 }
 
+/// Every literal the dispatch below accepts, aliases included.
+///
+/// [`COMMANDS`] is the *discoverable* subset offered by Tab completion; this is
+/// the full set, and command rectification needs the full set: correcting input
+/// the dispatch would have accepted (`/url`, `/q`, `/log`) into some
+/// near-neighbour would break working commands. A test keeps the two in sync.
+pub(crate) const ACCEPTED: &[&str] = &[
+    "/?", "/agents", "/attach", "/audit", "/auth", "/burp", "/cap", "/capability", "/chain", "/changed", "/clear", "/config",
+    "/context", "/continue", "/creds", "/diff", "/exclude", "/exit", "/expand", "/feed",
+    "/finding", "/findings", "/focus", "/forget", "/full", "/go", "/goal", "/graph", "/guardrail", "/guardrails", "/help",
+    "/history", "/idle", "/inscope", "/instructions", "/integration", "/integrations", "/key", "/log",
+    "/logs", "/mcp", "/memory", "/model", "/models", "/objective", "/objectives", "/observe",
+    "/observe-only", "/offline",
+    "/onboard", "/only", "/oos", "/outofscope", "/policy", "/providers", "/proxy", "/quick", "/economy", "/eco", "/q", "/quit", "/recon",
+    "/pause", "/repo", "/report", "/results", "/resume", "/retest", "/revalidate", "/run", "/runs",
+    "/scope", "/scope-out", "/show", "/status", "/stop", "/sub", "/subscription", "/target",
+    "/temp-email", "/tempmail", "/theme", "/timeout", "/ua", "/url", "/useragent", "/validate",
+    "/votes",
+];
+
 /// All slash-commands, for Tab completion.
 const COMMANDS: &[&str] = &[
     "/help", "/onboard", "/show", "/config", "/providers", "/model", "/key", "/sub", "/target",
     "/repo", "/auth", "/creds", "/focus", "/objective", "/scope-out", "/attach", "/context", "/mcp", "/offline",
-    "/votes", "/chain", "/recon", "/tempmail", "/timeout", "/proxy", "/burp", "/ua", "/agents", "/only", "/theme", "/clear", "/run", "/stop", "/continue", "/runs", "/results", "/report",
-    "/status", "/logs", "/diff", "/retest", "/validate", "/finding", "/expand", "/integrations", "/quit",
+    "/quick", "/economy", "/eco", "/votes", "/chain", "/recon", "/tempmail", "/timeout", "/proxy", "/burp", "/ua", "/agents", "/only", "/theme", "/clear", "/run", "/stop", "/pause", "/continue", "/runs", "/results", "/report",
+    "/status", "/logs", "/diff", "/retest", "/validate", "/finding", "/expand", "/integrations",
+    "/memory", "/forget", "/graph", "/inscope", "/observe", "/guardrail", "/policy",
+    "/capability", "/audit", "/quit",
 ];
 
 /// rustyline helper: Tab-completes `/commands` and `@filesystem-paths`,
@@ -232,6 +254,13 @@ struct RunRecord {
 }
 
 struct Session {
+    /// Egress and out-of-band configuration, handed down from the launcher —
+    /// not settable from inside the session (see [`SessionAuth`]).
+    transport: Option<String>,
+    oob_domain: Option<String>,
+    oob_http: Option<String>,
+    oob_dns: Option<String>,
+    sms: Option<String>,
     models: Vec<String>,
     subscription: bool,
     mcp: bool,
@@ -260,6 +289,12 @@ struct Session {
     objective: Option<String>,
     /// Explicit out-of-scope exclusions the agents must not touch.
     out_of_scope: Option<String>,
+    /// Authorization boundary + guardrails, enforced by the harness.
+    policy: harness::scope::ScopePolicy,
+    /// Signed capability token for this engagement, when one was issued.
+    capability: Option<String>,
+    /// Risk ceilings, reasoning rules and proof requirements.
+    engagement: harness::policy::EngagementPolicy,
     attachments: Vec<String>,
     color: bool,
     /// Engagement scope from onboarding: web | infra | cloud | ai | skills.
@@ -273,6 +308,11 @@ struct Session {
 impl Default for Session {
     fn default() -> Self {
         Session {
+            transport: None,
+            oob_domain: None,
+            oob_http: None,
+            oob_dns: None,
+            sms: None,
             models: vec!["anthropic:claude-opus-4-8".into()],
             subscription: harness::installed_cli_backends().contains(&"claude"),
             mcp: false,
@@ -293,6 +333,9 @@ impl Default for Session {
             instructions: None,
             objective: None,
             out_of_scope: None,
+            policy: Default::default(),
+            capability: None,
+            engagement: Default::default(),
             attachments: Vec::new(),
             color: true,
             scope: "web",
@@ -371,12 +414,33 @@ impl Reader {
 // MutexGuard across `run().await` on purpose — run() mutates that history for
 // the whole async operation and no other task contends for it there.
 #[allow(clippy::await_holding_lock)]
-pub async fn repl(base: &Path) -> anyhow::Result<()> {
+/// Authorization handed to an interactive session at launch.
+///
+/// It is passed in rather than typed because a session that can widen its own
+/// grant is not constrained by one. `/capability` inside the REPL can install
+/// a token and narrow the scope; it cannot raise the ceiling this sets.
+#[derive(Debug, Default, Clone)]
+pub struct SessionAuth {
+    pub capability: Option<String>,
+    pub in_scope: Vec<String>,
+    pub environment: Option<String>,
+    pub policy: Option<String>,
+    /// Egress route. Passed in like the grant, and for the same reason: a
+    /// session that can re-route its own traffic mid-engagement can leave the
+    /// network it was authorized on.
+    pub transport: Option<String>,
+    pub oob_domain: Option<String>,
+    pub oob_http: Option<String>,
+    pub oob_dns: Option<String>,
+    pub sms: Option<String>,
+}
+
+pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
     let lib = agents::load(base);
     let backends = harness::installed_cli_backends();
     println!("\x1b[1m");
     println!("  ███╗   ██╗███████╗██╗   ██╗██████╗  ██████╗");
-    println!("  ████╗  ██║██╔════╝██║   ██║██╔══██╗██╔═══██╗   NeuroSploit v4.0.0");
+    println!("  ████╗  ██║██╔════╝██║   ██║██╔══██╗██╔═══██╗   NeuroSploit v4.2.0");
     println!("  ██╔██╗ ██║█████╗  ██║   ██║██████╔╝██║   ██║   interactive harness");
     println!("  ██║╚██╗██║██╔══╝  ██║   ██║██╔══██╗██║   ██║   by Joas A Santos");
     println!("  ██║ ╚████║███████╗╚██████╔╝██║  ██║╚██████╔╝   & Red Team Leaders");
@@ -394,9 +458,59 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
     if resumed || past > 0 {
         println!("  ↻ resumed project session from {} — {} past run(s)", proj_dir().display(), past);
     }
+    // Authorization from the launcher, applied before anything can run.
+    if let Some(envname) = auth.environment.as_deref() {
+        match harness::policy::Environment::parse(envname) {
+            Some(e) => s.engagement.safety.environment = e,
+            None => println!("  \x1b[33m⚠ unknown environment '{envname}' — keeping {}\x1b[0m", s.engagement.safety.environment.as_str()),
+        }
+    }
+    if let Some(profile) = auth.policy.as_deref() {
+        s.engagement = match profile.trim().to_lowercase().as_str() {
+            "ot" | "ics" | "scada" => harness::policy::EngagementPolicy::ot(),
+            _ => harness::policy::EngagementPolicy::web(s.engagement.safety.environment),
+        };
+    }
+    for entry in &auth.in_scope {
+        s.policy.allow(entry);
+    }
+    s.transport = auth.transport.clone();
+    s.oob_domain = auth.oob_domain.clone();
+    s.oob_http = auth.oob_http.clone();
+    s.oob_dns = auth.oob_dns.clone();
+    s.sms = auth.sms.clone();
+    if let Some(t) = &s.transport {
+        println!("  \x1b[2m🔌 egress: {t}\x1b[0m");
+    }
+    if let Some(d) = &s.oob_domain {
+        println!("  \x1b[2m📡 out-of-band: *.{d}\x1b[0m");
+    }
+    if let Some(token) = auth.capability.as_deref() {
+        match harness::capability::key_from_env() {
+            None => println!("  \x1b[31m⛔ a capability token was supplied but no verification key is configured\x1b[0m — set NEUROSPLOIT_CAPABILITY_KEY. Not applied."),
+            Some(k) => match harness::capability::Capability::verify(token, &k) {
+                Ok(c) => {
+                    let (effective, dropped) = c.constrain(&s.policy);
+                    s.policy = effective;
+                    s.capability = Some(token.to_string());
+                    println!("  \x1b[32m🔏 capability verified\x1b[0m — {}", c.summary());
+                    if !dropped.is_empty() {
+                        println!("  \x1b[33m⚠ outside the grant, removed from scope:\x1b[0m {}", dropped.join(", "));
+                    }
+                }
+                Err(e) => {
+                    println!("  \x1b[31m⛔ {e}\x1b[0m");
+                    anyhow::bail!("capability token did not verify — refusing to start an unauthorized session");
+                }
+            },
+        }
+    }
+
     // A recovered interrupted run, carried in memory so `/continue` can relaunch
     // the engagement on the same target with these findings folded forward.
     let mut resumable: Option<(String, Vec<Finding>)> = None;
+    // Set when a recovered run should continue without waiting for a human.
+    let mut auto_resume = false;
     // Recover an interrupted run (REPL was quit/crashed mid-engagement): its
     // live findings were checkpointed to disk — fold them into /runs so
     // /results, /finding and /report still work.
@@ -411,8 +525,19 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
             save_runs(base, &h);
             println!("  \x1b[1;33m↻ recovered interrupted run on {} — {} finding(s) saved as run #{}\x1b[0m (/results {id} · /report {id})",
                 cp.target, cp.findings.len(), id);
-            println!("  \x1b[36m  ↳ /continue to keep testing this target — the {} finding(s) carry forward\x1b[0m", cp.findings.len());
             resumable = Some((cp.target.clone(), cp.findings.clone()));
+            // Resume by itself where nobody is watching: the web console drives
+            // this REPL over a pipe, and a run that stops there waits forever
+            // for a `/continue` no one will type. An interactive operator keeps
+            // the choice — relaunching an engagement spends tokens, and at a
+            // real terminal there is someone to decide.
+            auto_resume = !std::io::stdin().is_terminal()
+                || std::env::var("NEUROSPLOIT_AUTO_RESUME").map(|v| v == "1" || v == "true").unwrap_or(false);
+            if auto_resume {
+                println!("  \x1b[36m  ↳ resuming automatically — the {} finding(s) carry forward\x1b[0m", cp.findings.len());
+            } else {
+                println!("  \x1b[36m  ↳ /continue to keep testing this target — the {} finding(s) carry forward\x1b[0m", cp.findings.len());
+            }
         }
         clear_checkpoint();
     }
@@ -420,6 +545,12 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
     let mut reader = Reader::new(base);
     let mut active: Option<ActiveRun> = None;
     let mut queue: Vec<String> = Vec::new(); // remaining targets for a multi-target /run
+    // Commands to run before reading from the user — how an auto-resumed run
+    // re-enters the normal dispatch instead of duplicating /continue's logic.
+    let mut pending: Vec<String> = Vec::new();
+    if auto_resume && resumable.is_some() {
+        pending.push("/continue".into());
+    }
     // First-launch onboarding: pick scope (web/infra/cloud/ai/skills) → box → setup.
     if s.target.is_none() && s.repo.is_none() && std::io::stdin().is_terminal() {
         onboarding(&mut s);
@@ -434,7 +565,14 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
             active = start_background(base, &s, &mut reader, history.clone(), Some(&next), vec![]).await;
         }
         println!("{}", context_prompt(&s)); // dim context line above the prompt
-        let Some(line) = reader.read(PROMPT) else { println!("\n  bye."); break };
+        let line = if pending.is_empty() {
+            let Some(l) = reader.read(PROMPT) else { println!("\n  bye."); break };
+            l
+        } else {
+            let l = pending.remove(0);
+            println!("{PROMPT}{l}");
+            l
+        };
         // Ctrl-C → confirm before doing anything drastic (don't lose a live run).
         if line == CTRL_C {
             let run_active = active.as_ref().map(|a| !a.done.load(Ordering::Relaxed)).unwrap_or(false);
@@ -481,7 +619,30 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
                 None => continue,
             }
         };
-        let (cmd, arg) = (cmd.as_str(), arg.as_str());
+        // Rectify before dispatch, so the match below only ever sees a command
+        // it handles. A typo mid-run costs an operator their place in the
+        // output; correcting the obvious ones — and asking about the rest —
+        // keeps a slip from becoming a round trip through /help.
+        let cmd_owned = match crate::rectify::rectify_command(&cmd, ACCEPTED) {
+            crate::rectify::Fix::Accepted => cmd.clone(),
+            crate::rectify::Fix::Corrected { to, note } => {
+                println!("  \x1b[2m↻ {note}\x1b[0m");
+                to
+            }
+            crate::rectify::Fix::Ambiguous(v) => {
+                println!("  '{cmd}' matches {} commands: {}", v.len(), v.join("  "));
+                continue;
+            }
+            crate::rectify::Fix::Unknown(hints) => {
+                if hints.is_empty() {
+                    println!("  unknown command '{cmd}' — /help lists them all");
+                } else {
+                    println!("  unknown command '{cmd}' — did you mean {}?", hints.join(", "));
+                }
+                continue;
+            }
+        };
+        let (cmd, arg) = (cmd_owned.as_str(), arg.as_str());
         match cmd {
             "/help" | "/?" => help(),
             "/show" | "/config" => show(&s),
@@ -496,7 +657,17 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
                 if arg.is_empty() {
                     pick_models(&mut s);
                 } else {
-                    s.models = arg.split([',', ' ']).filter(|x| !x.is_empty()).map(String::from).collect();
+                    // A model id is long and easy to fumble; an unrecognized one
+                    // otherwise fails much later, inside the run.
+                    let catalog: Vec<String> = harness::providers().iter()
+                        .flat_map(|p| p.models.iter().map(move |m| format!("{}:{}", p.key, m)))
+                        .collect();
+                    s.models = arg.split([',', ' ']).filter(|x| !x.is_empty()).map(|x| {
+                        match crate::rectify::nearest_model(x, &catalog) {
+                            Some(fixed) => { println!("  \x1b[2m↻ corrected '{x}' → '{fixed}'\x1b[0m"); fixed }
+                            None => x.to_string(),
+                        }
+                    }).collect();
                     println!("  models: {}", s.models.join(", "));
                 }
                 // If a run is paused on exhaustion, queue the newly-chosen models
@@ -518,9 +689,11 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
                 if arg.is_empty() { println!("  target: {}", s.target.clone().unwrap_or_else(|| "(none) — set with /target <url[,url2,...]>, clear with /target clear".into())); }
                 else if arg == "clear" { s.target = None; println!("  target cleared"); }
                 else {
-                    // Accept one URL or a comma-separated list; normalize each.
+                    // Accept one URL or a comma-separated list; normalize each —
+                    // a missing scheme, a mistyped one (`htp://`, `https:/`) or
+                    // a trailing comma from a paste all resolve to one reading.
                     let ts: Vec<String> = arg.split(',').map(|x| x.trim()).filter(|x| !x.is_empty())
-                        .map(|x| if x.starts_with("http") { x.to_string() } else { format!("https://{x}") })
+                        .map(|x| crate::rectify::rectify_url(x).unwrap_or_else(|| x.to_string()))
                         .collect();
                     s.target = Some(ts.join(","));
                     if ts.len() > 1 { println!("  targets ({}): {}", ts.len(), ts.join(", ")); println!("  \x1b[2m/run tests them sequentially, one report each\x1b[0m"); }
@@ -625,7 +798,23 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
                     Some(prev) if !prev.trim().is_empty() => format!("{prev}; {arg}"),
                     _ => arg.to_string(),
                 });
-                println!("  out-of-scope: {}  \x1b[2m(hard constraint — agents skip these)\x1b[0m", s.out_of_scope.clone().unwrap_or_default());
+                // Host-shaped entries become ENFORCED exclusions right away, so
+                // `/policy` shows what will actually be blocked rather than
+                // deferring the promotion to run time. Prose ("no destructive
+                // tests") stays prompt guidance — it isn't a pattern.
+                let mut enforced = 0usize;
+                for tok in arg.split([',', ';']) {
+                    let t = tok.trim();
+                    if !t.is_empty() && !t.contains(' ') && (t.contains('.') || t.contains('/')) {
+                        enforced += s.policy.deny(t);
+                    }
+                }
+                println!("  out-of-scope: {}", s.out_of_scope.clone().unwrap_or_default());
+                if enforced > 0 {
+                    println!("  \x1b[2m{enforced} host rule(s) ENFORCED by the guard — requests there are blocked before they are sent\x1b[0m");
+                } else {
+                    println!("  \x1b[2m(guidance for the agents — not a host rule; use /scope-out <host> or /inscope to change the enforced boundary)\x1b[0m");
+                }
             }
             "/attach" => { let n = attach_path(arg.trim_start_matches('@'), &mut s); if n > 0 { println!("  attached ({} total)", s.attachments.len()); } }
             "/context" => {
@@ -640,7 +829,14 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
             "/mcp" => { s.mcp = !matches!(arg, "off" | "false" | "0" | "no"); println!("  Playwright MCP: {}", onoff(s.mcp)); }
             "/offline" => { s.offline = !matches!(arg, "off" | "false" | "0" | "no"); println!("  offline: {}", onoff(s.offline)); }
             "/integrations" | "/integration" => integrations_cmd(arg),
-            "/votes" => { s.vote_n = arg.parse().unwrap_or(s.vote_n); println!("  votes: {}", s.vote_n); }
+            "/votes" => {
+                // Out of range used to fall back to the current value in
+                // silence, so `/votes 30` looked applied and wasn't.
+                let (n, note) = crate::rectify::rectify_count(arg, 1, 9, s.vote_n);
+                if let Some(note) = note { println!("  \x1b[2m↻ {note}\x1b[0m"); }
+                s.vote_n = n;
+                println!("  votes: {}", s.vote_n);
+            }
             "/chain" => {
                 if arg.is_empty() { println!("  attack-chain depth: {} (0 disables) — set with /chain <n>", s.chain_depth); }
                 else { s.chain_depth = arg.parse().unwrap_or(s.chain_depth); println!("  attack-chain depth: {}", s.chain_depth); }
@@ -649,6 +845,18 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
                 let lvl = |n: usize| ["", "quick", "standard", "deep", "exhaustive"].get(n).copied().unwrap_or("deep");
                 if arg.is_empty() { println!("  recon intensity: {} ({}) — set with /recon <1-4>  [1 quick · 2 standard · 3 deep · 4 exhaustive]", s.recon_intensity, lvl(s.recon_intensity)); }
                 else { s.recon_intensity = arg.parse::<usize>().unwrap_or(s.recon_intensity).clamp(1, 4); println!("  recon intensity: {} ({}) — more rounds, more enumeration, auto-installs tools", s.recon_intensity, lvl(s.recon_intensity)); }
+            }
+            "/quick" | "/economy" | "/eco" => {
+                // Economy preset for a short, low-cost test — the single switch
+                // for "fast and cheap" instead of tuning each knob. The big
+                // saver is one voter instead of two or three.
+                s.vote_n = 1;
+                s.chain_depth = 1;
+                s.recon_intensity = 1;
+                s.max_agents = 6;
+                println!("  \x1b[1;32m⚡ quick mode\x1b[0m — economy preset for a short, low-cost run:");
+                println!("    1 voter · 1 chain round · light recon · ≤6 agents");
+                println!("    \x1b[2m(raise any back up with /votes /chain /recon /agents — or /run to go)\x1b[0m");
             }
             "/tempmail" | "/temp-email" => {
                 match arg.trim() {
@@ -724,6 +932,19 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
                         }
                     }
                     _ => println!("  no active run."),
+                }
+            }
+            "/pause" | "/hold" => {
+                match active.as_ref() {
+                    Some(a) if !a.done.load(Ordering::Relaxed) => {
+                        if a.paused.load(Ordering::Relaxed) {
+                            println!("  run is already paused — /continue to resume.");
+                        } else {
+                            a.paused.store(true, Ordering::Relaxed);
+                            println!("  \x1b[1;33m⏸ pausing\x1b[0m — in-flight agents finish, then the run holds. Findings so far are kept. /continue to resume, /stop to finish early.");
+                        }
+                    }
+                    _ => println!("  no run in progress."),
                 }
             }
             "/continue" | "/resume" => {
@@ -925,7 +1146,150 @@ pub async fn repl(base: &Path) -> anyhow::Result<()> {
                 }
                 save_session(&s); println!("  session saved → {} · bye.", proj_dir().display()); break;
             }
-            other => println!("  unknown command '{other}' — try /help"),
+            "/inscope" | "/policy" => {
+                if cmd == "/policy" || arg.trim().is_empty() {
+                    let effective = if s.policy.hard.is_empty() {
+                        s.target.as_deref().map(harness::scope::ScopePolicy::for_target)
+                    } else { None };
+                    let p = effective.as_ref().unwrap_or(&s.policy);
+                    println!("  ┌ scope policy{}", if effective.is_some() { " (derived from /target — nothing added yet)" } else { "" });
+                    println!("  │ {}", p.summary());
+                    println!("  └ /inscope <host|*.dom|cidr|url> · /scope-out <host> · /observe <host> · /guardrail <key> <value>");
+                } else {
+                    if s.policy.hard.is_empty() {
+                        // Seed from the target first, or adding one host would
+                        // silently make the target itself out of scope.
+                        if let Some(t) = s.target.clone() { s.policy.allow(&harness::scope::host_of(&t)); }
+                    }
+                    // Count what actually survived the grant, not what was
+                    // typed — reporting an entry as added when the ceiling
+                    // dropped it is the same lie the ceiling exists to prevent.
+                    let before = s.policy.hard.len();
+                    s.policy.allow(arg);
+                    let refused = reapply_grant(&mut s);
+                    if !refused.is_empty() {
+                        println!("  \x1b[33m⛔ outside the capability grant, not authorized:\x1b[0m {}", refused.join(", "));
+                    }
+                    let added = s.policy.hard.len().saturating_sub(before);
+                    println!("  +{added} in scope · {}", s.policy.summary());
+                }
+            }
+            "/observe" | "/observe-only" => {
+                if arg.trim().is_empty() { println!("  usage: /observe <host|*.domain> — discovery allowed there, interaction blocked"); }
+                else {
+                    let n = s.policy.observe_only(arg);
+                    reapply_grant(&mut s);
+                    println!("  +{n} observe-only · {}", s.policy.summary());
+                }
+            }
+            "/guardrail" | "/guardrails" => {
+                let (k, v) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+                match k.trim().to_lowercase().as_str() {
+                    "" => println!("  guardrails: {} · keys: destructive on|off · accounts <n|off> · rate <req/min>", s.policy.summary()),
+                    "destructive" => {
+                        s.policy.soft.allow_destructive_methods = matches!(v.trim(), "on" | "yes" | "true" | "1");
+                        println!("  destructive methods: {}", if s.policy.soft.allow_destructive_methods { "ALLOWED" } else { "blocked" });
+                    }
+                    "accounts" => {
+                        if matches!(v.trim(), "off" | "no" | "0") {
+                            s.policy.soft.allow_account_creation = false;
+                            println!("  account creation: blocked");
+                        } else {
+                            s.policy.soft.allow_account_creation = true;
+                            let (n, note) = crate::rectify::rectify_count(v, 0, 50, s.policy.soft.max_accounts as usize);
+                            if let Some(note) = note { println!("  \x1b[2m↻ {note}\x1b[0m"); }
+                            s.policy.soft.max_accounts = n as u32;
+                            println!("  account creation: allowed, max {n}");
+                        }
+                    }
+                    "rate" => {
+                        let (n, note) = crate::rectify::rectify_count(v, 0, 100_000, s.policy.soft.max_requests_per_minute as usize);
+                        if let Some(note) = note { println!("  \x1b[2m↻ {note}\x1b[0m"); }
+                        s.policy.soft.max_requests_per_minute = n as u32;
+                        println!("  rate guard: {} req/min", if n == 0 { "unlimited".into() } else { n.to_string() });
+                    }
+                    other => println!("  unknown guardrail '{other}' — destructive · accounts · rate"),
+                }
+            }
+            "/capability" | "/cap" => {
+                if arg.trim().is_empty() {
+                    match &s.capability {
+                        None => println!("  no capability token — this engagement runs on local configuration alone.\n  \x1b[2m/capability <ns-cap.v1....> · verified with NEUROSPLOIT_CAPABILITY_KEY\x1b[0m"),
+                        Some(t) => match harness::capability::key_from_env() {
+                            None => println!("  \x1b[33m⚠ a token is set but no key is configured\x1b[0m — set NEUROSPLOIT_CAPABILITY_KEY. Claims (UNVERIFIED): {}",
+                                harness::capability::Capability::peek(t).map(|c| c.summary()).unwrap_or_else(|| "unreadable".into())),
+                            Some(k) => match harness::capability::Capability::verify(t, &k) {
+                                Ok(c) => println!("  \x1b[32m🔏 verified\x1b[0m — {}", c.summary()),
+                                Err(e) => println!("  \x1b[31m⛔ {e}\x1b[0m"),
+                            },
+                        },
+                    }
+                } else if arg.trim() == "clear" {
+                    s.capability = None;
+                    println!("  capability token cleared — back to local configuration");
+                } else {
+                    let token = arg.trim().to_string();
+                    match harness::capability::key_from_env() {
+                        None => println!("  \x1b[31m⛔ no verification key\x1b[0m — set NEUROSPLOIT_CAPABILITY_KEY (or _KEY_FILE). An unverifiable token is not authorization; not stored."),
+                        Some(k) => match harness::capability::Capability::verify(&token, &k) {
+                            Ok(c) => {
+                                let (effective, dropped) = c.constrain(&s.policy);
+                                if !dropped.is_empty() {
+                                    println!("  \x1b[33m⚠ outside the grant, removed from scope:\x1b[0m {}", dropped.join(", "));
+                                }
+                                s.policy = effective;
+                                s.capability = Some(token);
+                                println!("  \x1b[32m🔏 verified\x1b[0m — {}", c.summary());
+                                println!("  scope now: {}", s.policy.summary());
+                            }
+                            Err(e) => println!("  \x1b[31m⛔ {e}\x1b[0m — token not stored"),
+                        },
+                    }
+                }
+            }
+            "/audit" => {
+                // The trail of the most recent run, plus the chain check that
+                // makes it evidence rather than a log file.
+                let h = history.lock().unwrap();
+                let path = h.last().map(|r| std::path::PathBuf::from(&r.workdir).join("audit.jsonl"))
+                    .unwrap_or_else(|| proj_dir().join("audit.jsonl"));
+                let log = harness::audit::AuditLog::open(&path);
+                let records = log.read_all();
+                if records.is_empty() {
+                    println!("  no audit records yet ({})", path.display());
+                } else {
+                    let n: usize = arg.trim().parse().unwrap_or(15);
+                    println!("  ── audit trail · {} record(s) · {} ──", records.len(), path.display());
+                    for r in records.iter().rev().take(n).rev() {
+                        let decision = if r.policy_decision.starts_with("deny") { format!("\x1b[31m{}\x1b[0m", r.policy_decision) }
+                            else if r.policy_decision.starts_with("confirm") { format!("\x1b[33m{}\x1b[0m", r.policy_decision) }
+                            else { format!("\x1b[2m{}\x1b[0m", r.policy_decision) };
+                        println!("  #{:<3} {} {:<18} {:<26} {}", r.seq, r.timestamp, trunc(&r.action, 18), trunc(&r.target, 26), decision);
+                        if !r.result.is_empty() { println!("       \x1b[2m{}\x1b[0m", trunc(&r.result, 100)); }
+                    }
+                    match log.verify() {
+                        Ok(n) => println!("  \x1b[32m✓ hash chain intact\x1b[0m across {n} record(s)"),
+                        Err(e) => println!("  \x1b[31m⛔ chain broken: {e}\x1b[0m"),
+                    }
+                }
+            }
+            "/memory" => memory_cmd(&s, arg),
+            "/forget" => {
+                if arg.trim().is_empty() {
+                    println!("  usage: /forget <text> — drops every memory whose text contains it");
+                } else {
+                    let mut mem = harness::memory::Memory::open(proj_dir().join("memory"));
+                    let n = mem.forget(arg.trim());
+                    println!("  forgot {n} memo(s) matching '{}'", arg.trim());
+                }
+            }
+            "/graph" => {
+                let g = harness::knowledge_graph::KnowledgeGraph::load(proj_dir().join("graph.json"));
+                print!("{}", g.summary());
+            }
+            // Rectification only forwards commands listed in ACCEPTED, so
+            // reaching here means ACCEPTED lists something this match forgot.
+            other => println!("  '{other}' is listed but not implemented — please report this."),
         }
     }
     Ok(())
@@ -1123,6 +1487,14 @@ async fn run(base: &Path, s: &Session, history: &mut Vec<RunRecord>) {
     };
     cfg.objective = s.objective.clone();
     cfg.out_of_scope = s.out_of_scope.clone();
+    cfg.scope = s.policy.clone();
+    cfg.capability = s.capability.clone();
+    cfg.policy = s.engagement.clone();
+    cfg.transport = s.transport.clone();
+    cfg.oob_domain = s.oob_domain.clone();
+    cfg.oob_http = s.oob_http.clone();
+    cfg.oob_dns = s.oob_dns.clone();
+    cfg.sms = s.sms.clone();
     cfg.auth = s.auth.clone();
     cfg.pinned = s.pinned.clone();
     // Multiple /auth identities → prepend the access-control (IDOR/BOLA/BFLA) directive.
@@ -1198,6 +1570,14 @@ async fn start_background(base: &Path, s: &Session, reader: &mut Reader,
         else { Some(format!("{}\n\nATTACHED CONTEXT:\n{}", s.instructions.clone().unwrap_or_default(), s.attachments.join("\n\n"))) };
     cfg.objective = s.objective.clone();
     cfg.out_of_scope = s.out_of_scope.clone();
+    cfg.scope = s.policy.clone();
+    cfg.capability = s.capability.clone();
+    cfg.policy = s.engagement.clone();
+    cfg.transport = s.transport.clone();
+    cfg.oob_domain = s.oob_domain.clone();
+    cfg.oob_http = s.oob_http.clone();
+    cfg.oob_dns = s.oob_dns.clone();
+    cfg.sms = s.sms.clone();
     cfg.auth = s.auth.clone();
     cfg.pinned = s.pinned.clone();
     if matches!(mode_e, crate::Mode::Grey) { cfg.repo = s.repo.clone(); }
@@ -1348,6 +1728,63 @@ fn merge_findings(prior: Vec<Finding>, mut fresh: Vec<Finding>) -> Vec<Finding> 
     fresh
 }
 
+/// Re-apply the capability ceiling after the session changed its own scope.
+///
+/// Without this, `/inscope` could widen the boundary past the grant — the one
+/// thing a capability token exists to prevent. The run itself would still be
+/// constrained (the pipeline re-applies the grant), but `/policy` would show a
+/// boundary that is not real, and a tool that misreports its own limits is
+/// worse than one with none.
+fn reapply_grant(s: &mut Session) -> Vec<String> {
+    let Some(token) = s.capability.clone() else { return Vec::new() };
+    let Some(key) = harness::capability::key_from_env() else { return Vec::new() };
+    let Ok(cap) = harness::capability::Capability::verify(&token, &key) else { return Vec::new() };
+    let (effective, dropped) = cap.constrain(&s.policy);
+    s.policy = effective;
+    dropped
+}
+
+/// `/memory` — inspect what the harness has learned, or search it.
+///
+/// The four tiers are shown separately because they mean different things: an
+/// engagement memo is about *this* target, a reusable one is a lesson that
+/// already held on two of them. Collapsing them into one list would hide the
+/// distinction that makes the promotion ladder worth having.
+fn memory_cmd(s: &Session, arg: &str) {
+    let mem = harness::memory::Memory::open(proj_dir().join("memory"));
+    let (w, e, t, r) = mem.counts();
+    let q = arg.trim();
+    if q.is_empty() {
+        println!("  ┌ memory · working {w} · engagement {e} · technique {t} · reusable {r}");
+        let recent = mem.dump();
+        if recent.is_empty() {
+            println!("  │ (nothing learned yet — memory fills in as runs finish)");
+        }
+        for m in recent.iter().take(12) {
+            println!("  │ [{:<10} {:>3}%] {}", m.tier.as_str(), (m.confidence * 100.0) as u32, trunc(&m.text, 92));
+        }
+        if recent.len() > 12 {
+            println!("  │ … {} more · /memory <text> to search", recent.len() - 12);
+        }
+        println!("  └ /forget <text> removes matching memos");
+        return;
+    }
+    let hits = mem.recall(&harness::memory::Query {
+        text: q.to_string(),
+        target: s.target.clone().unwrap_or_default(),
+        limit: 15,
+        ..Default::default()
+    });
+    if hits.is_empty() {
+        println!("  no memory matches '{q}'");
+        return;
+    }
+    println!("  ── {} match(es) for '{q}' ──", hits.len());
+    for h in hits {
+        println!("  [{:.2}] \x1b[2m{:<10}\x1b[0m {}", h.score, h.memo.tier.as_str(), trunc(&h.memo.text, 96));
+    }
+}
+
 /// Project-local store: `<cwd>/.neurosploit/` so each project keeps its own
 /// session, run history and command history (resume on reopen). No DB needed —
 /// it's structured state, not semantic search.
@@ -1394,6 +1831,16 @@ struct Snapshot {
     objective: Option<String>,
     #[serde(default)]
     out_of_scope: Option<String>,
+    /// Scope written back as the text the operator typed, so the file stays
+    /// readable and editable by hand.
+    #[serde(default)]
+    scope_in: Vec<String>,
+    #[serde(default)]
+    scope_out: Vec<String>,
+    #[serde(default)]
+    scope_observe: Vec<String>,
+    #[serde(default)]
+    soft: Option<harness::scope::SoftScope>,
 }
 fn session_path() -> std::path::PathBuf { proj_dir().join("session.json") }
 fn save_session(s: &Session) {
@@ -1403,6 +1850,10 @@ fn save_session(s: &Session) {
         repo: s.repo.clone(), auth: s.auth.clone(), creds: s.creds.clone(),
         instructions: s.instructions.clone(),
         objective: s.objective.clone(), out_of_scope: s.out_of_scope.clone(),
+        scope_in: s.policy.hard.iter().map(|p| p.as_text()).collect(),
+        scope_out: s.policy.exclude.iter().map(|p| p.as_text()).collect(),
+        scope_observe: s.policy.soft.observe_only.iter().map(|p| p.as_text()).collect(),
+        soft: Some(s.policy.soft.clone()),
     };
     if let Ok(j) = serde_json::to_string_pretty(&snap) { std::fs::write(session_path(), j).ok(); }
 }
@@ -1416,6 +1867,10 @@ fn load_session(s: &mut Session) -> bool {
     s.target = snap.target; s.repo = snap.repo; s.auth = snap.auth;
     s.creds = snap.creds; s.instructions = snap.instructions;
     s.objective = snap.objective; s.out_of_scope = snap.out_of_scope;
+    if let Some(soft) = snap.soft { s.policy.soft = soft; }
+    for t in snap.scope_in { s.policy.allow(&t); }
+    for t in snap.scope_out { s.policy.deny(&t); }
+    for t in snap.scope_observe { s.policy.observe_only(&t); }
     true
 }
 
@@ -1734,7 +2189,13 @@ fn help() {
     h("/creds <file.yaml>", "creds: jwt/header/cookie/login + ssh/windows + aws/gcp/azure + roles");
     h("/focus <text>",      "steer the tests (or just type the instruction)");
     h("/objective <text>",  "engagement goal/context — shapes what agents prioritise & count as impact");
-    h("/scope-out <text>",  "out-of-scope exclusions — hard constraint, agents skip these (clear to reset)");
+    h("/scope-out <text>",  "out-of-scope exclusions — host-shaped entries become ENFORCED denials");
+    h("/inscope <patterns>","authorize more hosts: host · *.domain · 10.0.0.0/24 · https://host/path");
+    h("/observe <host>",    "observe-only: discovery allowed there, interaction blocked");
+    h("/guardrail k v",     "soft scope: destructive on|off · accounts <n|off> · rate <req/min>");
+    h("/policy",            "show the enforced scope + guardrails");
+    h("/capability <token>","signed grant (ns-cap.v1...) — verified, and it CAPS the scope");
+    h("/audit [n]",         "the run's action trail + hash-chain verification");
     h("@path @dir @f:1-20", "attach a file/folder/line-range to context (Tab → menu)");
     h("/attach <path>",     "attach a file/folder to context");
     h("/context",           "list current attachments");
@@ -1751,6 +2212,7 @@ fn help() {
     h("/status [n]",        "live progress + findings while running (or a past run #)");
     h("/logs [n]",          "recent activity feed of the running test (recon/tools/findings)");
     h("/stop",              "stop: [1] validate+report  [2] raw report now  [3] discard");
+    h("/pause",             "hold the run where it is — in-flight agents finish, nothing is lost");
     h("/continue",          "resume a paused (token/quota) OR a recovered interrupted run — carries findings forward");
     h("/results [n]",       "browse findings (target → vuln → detail; Esc = back)");
     h("/finding [n]",       "pick a finding and see its command + PoC + evidence");
@@ -1759,6 +2221,11 @@ fn help() {
     h("/diff",              "what changed vs the last run");
     h("/retest [n]",        "re-verify a past run's findings (re-runs the test)");
     h("/validate [n]",      "false-positive validate a recovered/past run (no re-test)");
+
+    println!("\n  \x1b[2mKNOWLEDGE\x1b[0m");
+    h("/memory [text]",     "what the harness learned (working·engagement·technique·reusable); search with text");
+    h("/forget <text>",     "drop every memory whose text matches");
+    h("/graph",             "attack knowledge graph: entities, top attack paths, unproven frontier");
 
     println!("\n  \x1b[2mINTEGRATIONS\x1b[0m");
     h("/integrations",      "show · enable/disable github|gitlab|jira · setup <name>");
@@ -1769,6 +2236,7 @@ fn help() {
     h("/votes <n>",         "number of validator votes per finding");
     h("/chain <n>",         "attack-chain depth (post-exploitation pivots; 0 = off)");
     h("/recon <1-4>",       "recon intensity: 1 quick · 2 standard · 3 deep · 4 exhaustive (installs tools)");
+    h("/quick",             "economy preset: short, low-cost run (1 voter · 1 chain round · light recon · ≤6 agents)");
     h("/tempmail on|off",   "opt-in disposable inbox (mail.tm) to read a register confirmation code");
     h("/timeout <min>",     "idle guardrail: stop if no new finding in <min> (0 = off)");
     h("/proxy <url>|off",   "route agent HTTP through Burp/ZAP  (/burp = default :8080)");
@@ -2287,4 +2755,23 @@ mod nl_tests {
         assert_eq!(parse_intent_fast("recon 4 em example.com").0.recon, Some(4));
     }
 
+    /// Rectification forwards only what ACCEPTED lists, so anything offered by
+    /// Tab completion but missing from ACCEPTED would become unreachable — the
+    /// user would type a real command and be told it doesn't exist.
+    #[test]
+    fn every_completable_command_is_accepted_by_the_dispatch() {
+        let missing: Vec<&&str> = COMMANDS.iter().filter(|c| !ACCEPTED.contains(c)).collect();
+        assert!(missing.is_empty(), "completed but not dispatchable: {missing:?}");
+    }
+
+    #[test]
+    fn accepted_commands_survive_rectification_untouched() {
+        for c in ACCEPTED {
+            assert_eq!(
+                crate::rectify::rectify_command(c, ACCEPTED),
+                crate::rectify::Fix::Accepted,
+                "{c} must reach the dispatch as typed"
+            );
+        }
+    }
 }

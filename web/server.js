@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * NeuroSploit v4.0.0 — web console backend.
+ * NeuroSploit v4.2.1 — web console backend.
  *
  * Zero-dependency Node HTTP server that:
  *  - serves the static SPA in ./public
@@ -22,6 +22,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
+const { StringDecoder } = require('node:string_decoder');
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -50,6 +51,30 @@ function saveEngagementName(runId, name) {
     .then(() => fsp.writeFile(NAMES_FILE, JSON.stringify(Object.fromEntries(engagementNames), null, 2)))
     .catch(() => {});
 }
+// Per-job persistence: the web server's job state (phase, findings, feed, and
+// the non-secret launch params) is mirrored to disk so a server restart or
+// crash doesn't lose the run — the UI can list it again and, for an
+// interrupted run/whitebox/greybox job, RESUME it (relaunch the REPL, which
+// auto-recovers the harness's own on-disk checkpoint and carries findings
+// forward). Secrets (API keys, creds-file contents) are never written here.
+const JOBS_DIR = path.join(ROOT, '.neurosploit', 'web-jobs');
+function jobFile(id) { return path.join(JOBS_DIR, `${id}.json`); }
+function persistJob(job) {
+  if (!job) return;
+  try {
+    fs.mkdirSync(JOBS_DIR, { recursive: true });
+    const snap = job.snapshot();
+    const rec = {
+      ...snap,
+      launch: job.launch || null,          // sanitized relaunch params (no secrets)
+      feedTail: job.feed.slice(-300),      // enough to repaint the live log
+      savedAt: Date.now(),
+    };
+    fs.writeFileSync(jobFile(job.id), JSON.stringify(rec));
+  } catch { /* best-effort — persistence never breaks a run */ }
+}
+function deleteJobFile(id) { try { fs.unlinkSync(jobFile(id)); } catch { /* gone already */ } }
+
 const PUBLIC_DIR = path.join(WEB_DIR, 'public');
 
 function findBinary() {
@@ -77,15 +102,15 @@ const PORT = Number(process.env.NEUROSPLOIT_WEB_PORT || process.env.PORT || 4173
 
 const PROVIDERS = [
   { key: 'anthropic', label: 'Anthropic Claude', kind: 'cli', envKey: 'ANTHROPIC_API_KEY',
-    models: ['claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
+    models: ['claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
   { key: 'openai', label: 'OpenAI (ChatGPT)', kind: 'cli', envKey: 'OPENAI_API_KEY',
-    models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2', 'gpt-5.1', 'gpt-5.1-codex', 'o4'] },
+    models: ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2', 'gpt-5.1', 'gpt-5.1-codex', 'o4'] },
   { key: 'xai', label: 'xAI Grok', kind: 'cli', envKey: 'XAI_API_KEY',
-    models: ['grok-4.5', 'grok-4', 'grok-4-fast'] },
+    models: ['grok-4.7', 'grok-4.5', 'grok-4', 'grok-4-fast'] },
   { key: 'gemini', label: 'Google Gemini', kind: 'cli', envKey: 'GEMINI_API_KEY',
-    models: ['gemini-3-pro', 'gemini-2.5-pro', 'gemini-2.5-flash'] },
+    models: ['gemini-3-pro', 'gemini-3.8-flash', 'gemini-2.5-pro', 'gemini-2.5-flash'] },
   { key: 'opencode', label: 'OpenCode Zen', kind: 'cli', envKey: 'OPENCODE_API_KEY',
-    models: ['claude-opus-5', 'claude-sonnet-5', 'gpt-5.6-sol', 'gpt-5.5', 'gemini-3-pro', 'grok-4.5', 'deepseek-v4-pro', 'qwen3.7-max', 'kimi-k3'] },
+    models: ['claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5', 'gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.5', 'gemini-3-pro', 'gemini-3.8-flash', 'grok-4.7', 'grok-4.5', 'glm-5.3', 'deepseek-v4.1', 'deepseek-v4-pro', 'qwen3.8-max', 'kimi-k3'] },
   { key: 'nous', label: 'Nous Research (Hermes)', kind: 'cli', envKey: 'NOUS_API_KEY',
     models: ['Hermes-4-405B', 'Hermes-4-70B', 'DeepHermes-3-Mistral-24B-Preview'] },
   { key: 'nvidia_nim', label: 'NVIDIA NIM', kind: 'api', envKey: 'NVIDIA_NIM_API_KEY',
@@ -95,7 +120,9 @@ const PROVIDERS = [
   { key: 'mistral', label: 'Mistral', kind: 'api', envKey: 'MISTRAL_API_KEY',
     models: ['mistral-large-latest', 'codestral-latest'] },
   { key: 'qwen', label: 'Qwen (DashScope)', kind: 'api', envKey: 'DASHSCOPE_API_KEY',
-    models: ['qwen-max', 'qwen2.5-coder-32b-instruct', 'qwq-plus'] },
+    models: ['qwen3.8-max', 'qwen3.8-omni-flash', 'qwen-max', 'qwen2.5-coder-32b-instruct', 'qwq-plus'] },
+  { key: 'zai', label: 'Z.ai (GLM)', kind: 'api', envKey: 'ZAI_API_KEY',
+    models: ['glm-5.3', 'glm-5.3-flashx', 'glm-4.6'] },
   { key: 'groq', label: 'Groq', kind: 'api', envKey: 'GROQ_API_KEY',
     models: ['llama-3.3-70b-versatile', 'qwen-2.5-coder-32b'] },
   { key: 'together', label: 'Together AI', kind: 'api', envKey: 'TOGETHER_API_KEY',
@@ -105,7 +132,7 @@ const PROVIDERS = [
   { key: 'litellm', label: 'LiteLLM (proxy)', kind: 'api', envKey: 'LITELLM_API_KEY',
     models: ['gpt-4o', 'claude-3-7-sonnet', 'gemini/gemini-2.5-pro'] },
   { key: 'openrouter', label: 'OpenRouter', kind: 'api', envKey: 'OPENROUTER_API_KEY',
-    models: ['anthropic/claude-opus-4-8', 'qwen/qwen-2.5-coder-32b-instruct', 'deepseek/deepseek-r1', 'meta-llama/llama-3.3-70b-instruct'] },
+    models: ['anthropic/claude-opus-5-5', 'anthropic/claude-opus-4-8', 'z-ai/glm-5.3', 'qwen/qwen3.8-max', 'deepseek/deepseek-v4.1', 'meta-llama/llama-3.3-70b-instruct'] },
   { key: 'azure', label: 'Azure OpenAI', kind: 'api', envKey: 'AZURE_OPENAI_API_KEY',
     models: ['gpt-4o', 'gpt-4o-mini', 'gpt-5.1', 'o4-mini'] },
   { key: 'ollama', label: 'Ollama (local)', kind: 'api', envKey: 'OLLAMA_API_KEY',
@@ -138,6 +165,49 @@ function buildCredsYaml({ auth, roles }) {
     lines.push(`${safe}:`, `  header: ${JSON.stringify(r.header)}`);
   }
   return lines.join('\n') + '\n';
+}
+
+// Turn the web form's Scoping/Guardrails object into the scope YAML the CLI
+// loads with --scope-file. The hard list is the boundary; everything else is a
+// guardrail inside it. Written to a temp file per job.
+function buildScopeYaml(scope) {
+  const lines = [];
+  const list = (v) => (Array.isArray(v) ? v : String(v || '').split(/[\n,;]+/)).map((x) => String(x).trim()).filter(Boolean);
+  const block = (key, items) => {
+    if (!items.length) return;
+    lines.push(`${key}:`);
+    for (const it of items) lines.push(`  - ${JSON.stringify(it)}`);
+  };
+  block('hard', list(scope.hard));
+  block('exclude', list(scope.exclude));
+  const soft = [];
+  const obs = list(scope.observeOnly);
+  if (obs.length) { soft.push('  observe_only:'); for (const o of obs) soft.push(`    - ${JSON.stringify(o)}`); }
+  soft.push(`  allow_destructive_methods: ${scope.allowDestructive ? 'true' : 'false'}`);
+  soft.push(`  allow_account_creation: ${scope.allowAccountCreation === false ? 'false' : 'true'}`);
+  if (scope.maxAccounts !== undefined && scope.maxAccounts !== '') soft.push(`  max_accounts: ${Number(scope.maxAccounts) || 0}`);
+  if (scope.rateLimit !== undefined && scope.rateLimit !== '') soft.push(`  max_requests_per_minute: ${Number(scope.rateLimit) || 0}`);
+  const forb = list(scope.forbidden);
+  if (forb.length) { soft.push('  forbidden_payloads:'); for (const fp of forb) soft.push(`    - ${JSON.stringify(fp)}`); }
+  const notes = list(scope.notes);
+  if (notes.length) { soft.push('  notes:'); for (const n of notes) soft.push(`    - ${JSON.stringify(n)}`); }
+  lines.push('soft:');
+  lines.push(...soft);
+  return lines.join('\n') + '\n';
+}
+
+// Only materialize a scope file when the operator actually set a hard boundary
+// through the form — otherwise the run keeps its normal target+flags behaviour.
+async function materializeScope(body, jobId) {
+  const scope = body.scope;
+  if (!scope) return undefined;
+  const hard = (Array.isArray(scope.hard) ? scope.hard : String(scope.hard || '').split(/[\n,;]+/)).map((x) => String(x).trim()).filter(Boolean);
+  if (!hard.length) return undefined; // no boundary set — nothing to enforce beyond flags
+  const dir = path.join(os.tmpdir(), 'neurosploit-web');
+  await fsp.mkdir(dir, { recursive: true });
+  const file = path.join(dir, `${jobId}.scope.yaml`);
+  await fsp.writeFile(file, buildScopeYaml(scope));
+  return file;
 }
 
 async function materializeCreds(body, jobId) {
@@ -390,6 +460,61 @@ async function listRuns() {
   return runs;
 }
 
+/// Flat aggregate over every run for the dashboard.
+///
+/// Returns per-finding tuples rather than a computed risk number: the FAIR
+/// estimate depends on assumptions (contact frequency, loss magnitude per
+/// severity) that belong to the operator, not to this server, so the browser
+/// computes it from parameters the operator can see and change.
+async function stats() {
+  let ids = [];
+  try {
+    ids = (await fsp.readdir(RUNS_DIR)).filter((d) => d.startsWith('ns-'));
+  } catch {
+    return { runs: [], findings: [], generated: Date.now() };
+  }
+  const runs = [];
+  const findings = [];
+  await Promise.all(ids.map(async (id) => {
+    const dir = path.join(RUNS_DIR, id);
+    const [status, fs_] = await Promise.all([
+      readJsonSafe(path.join(dir, 'status.json'), {}),
+      readJsonSafe(path.join(dir, 'findings.json'), []),
+    ]);
+    const meta = await readJsonSafe(path.join(dir, 'meta.json'), {});
+    const tsMatch = id.match(/^ns-(\d+)-/);
+    const ts = status.ts || (tsMatch ? Number(tsMatch[1]) : 0);
+    const target = status.target || meta.target || id.replace(/^ns-\d+-/, '');
+    runs.push({
+      id,
+      ts,
+      name: engagementNames.get(id) || '',
+      target,
+      state: status.state || 'unknown',
+      agentsRan: status.agents_ran || 0,
+      findings: fs_.length,
+    });
+    for (const f of fs_) {
+      findings.push({
+        runId: id,
+        target,
+        ts,
+        severity: f.severity || 'Info',
+        cwe: f.cwe || '',
+        owasp: f.owasp || '',
+        stage: f.stage || '',
+        agent: f.agent || '',
+        title: f.title || '',
+        exploitability: f.exploitability || '',
+        confidence: typeof f.confidence === 'number' ? f.confidence : 0,
+        reviewStatus: f.review_status || '',
+      });
+    }
+  }));
+  runs.sort((a, b) => b.ts - a.ts);
+  return { runs, findings, generated: Date.now() };
+}
+
 async function runDetail(id) {
   const dir = safeRunDir(id);
   if (!dir) return null;
@@ -398,7 +523,7 @@ async function runDetail(id) {
     readJsonSafe(path.join(dir, 'status.json'), {}),
     readJsonSafe(path.join(dir, 'findings.json'), []),
   ]);
-  const assets = ['report.html', 'report.pdf', 'report.md', 'recon.md', 'exploitation.md']
+  const assets = ['report.html', 'report.pdf', 'report.md', 'recon.md', 'exploitation.md', 'audit.jsonl', 'graph.json']
     .filter((f) => fs.existsSync(path.join(dir, f)));
   const pocs = await fsp.readdir(path.join(dir, 'pocs')).catch(() => []);
   return { id, name: engagementNames.get(id) || '', meta, status, findings, assets, pocs };
@@ -407,8 +532,34 @@ async function runDetail(id) {
 function safeRunDir(id) {
   if (!/^[a-zA-Z0-9_.-]+$/.test(id)) return null;
   const dir = path.join(RUNS_DIR, id);
-  if (!dir.startsWith(RUNS_DIR)) return null;
+  // Contain the delete to RUNS_DIR: reject anything that resolves out of it
+  // (defence in depth on top of the charset check, which already forbids `/`).
+  if (dir !== RUNS_DIR && !dir.startsWith(RUNS_DIR + path.sep)) return null;
   return dir;
+}
+
+/// Permanently delete one run: its whole directory (findings, evidence, PoCs,
+/// every report artifact) and its remembered engagement name. Returns false if
+/// the id is unsafe or the directory does not exist.
+async function deleteRun(id) {
+  const dir = safeRunDir(id);
+  if (!dir || dir === RUNS_DIR || !fs.existsSync(dir)) return false;
+  await fsp.rm(dir, { recursive: true, force: true });
+  if (engagementNames.delete(id)) {
+    await fsp.mkdir(path.dirname(NAMES_FILE), { recursive: true })
+      .then(() => fsp.writeFile(NAMES_FILE, JSON.stringify(Object.fromEntries(engagementNames), null, 2)))
+      .catch(() => {});
+  }
+  return true;
+}
+
+/// Delete every run under RUNS_DIR (ns-* directories only). Returns the count.
+async function deleteAllRuns() {
+  let ids = [];
+  try { ids = (await fsp.readdir(RUNS_DIR)).filter((d) => d.startsWith('ns-')); } catch { return 0; }
+  let n = 0;
+  for (const id of ids) { if (await deleteRun(id)) n += 1; }
+  return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +595,15 @@ class Job extends EventEmitter {
     this.feed.push(evt);
     if (this.feed.length > 2000) this.feed.shift();
     this.emit('event', evt);
+    // Persist on state-moving events (a finding, a phase marker, completion),
+    // throttled so a chatty log stream doesn't hammer the disk.
+    if (evt.type === 'finding' || evt.type === 'done') this._persistSoon(0);
+    else this._persistSoon(1500);
+  }
+  _persistSoon(delay) {
+    if (this._persistTimer) return;
+    this._persistTimer = setTimeout(() => { this._persistTimer = null; persistJob(this); }, delay);
+    if (this._persistTimer.unref) this._persistTimer.unref();
   }
   snapshot() {
     return {
@@ -461,6 +621,8 @@ class Job extends EventEmitter {
       exitCode: this.exitCode,
       reportUrl: this.reportUrl,
       startedAt: this.startedAt,
+      interrupted: !!this.interrupted,
+      resumable: !!this.resumable,
     };
   }
 }
@@ -473,7 +635,9 @@ function ingestLine(job, rawLine) {
   const low = line.toLowerCase();
   job.push({ type: 'log', line });
 
-  if (low.includes('token/quota exhausted') || low.includes('run is paused')) job.phase = 'paused (quota)';
+  if (low.includes('paused by operator')) job.phase = 'paused (operator)';
+  else if (low.includes('resumed by operator') || low.includes('▶ resumed')) job.phase = 'running';
+  else if (low.includes('token/quota exhausted') || low.includes('run is paused')) job.phase = 'paused (quota)';
   else if (low.includes('authentication failed') || low.includes('circuit breaker')) job.phase = 'paused (auth)';
   else if (low.startsWith('recon') || low.startsWith('ai-recon') || low.includes('recon round') || low.startsWith('probe:')) job.phase = 'recon';
   else if (low.includes('selected') && low.includes('agent')) {
@@ -532,6 +696,31 @@ function buildArgs(body) {
   if (body.focus) args.push('--focus', body.focus);
   if (body.objective) args.push('--objective', body.objective);
   if (body.outOfScope) args.push('--out-of-scope', body.outOfScope);
+  // Budget: omitted entirely means the full run, exactly as before budgets
+  // existed — the web console never caps a run the operator didn't cap.
+  if (body.budget && body.budget !== 'unlimited') args.push('--budget', body.budget);
+  if (body.tokenLimit) args.push('--token-limit', String(body.tokenLimit));
+  if (body.deepTestLimit) args.push('--deep-test-limit', String(body.deepTestLimit));
+  if (body.order === 'depth-first') args.push('--depth-first');
+  else if (body.order === 'coverage-first') args.push('--coverage-first');
+  if (body.samplePerRoute) args.push('--sample-per-route', String(body.samplePerRoute));
+  if (body.transport && body.transport !== 'direct') args.push('--transport', body.transport);
+  if (body.oobDomain) args.push('--oob-domain', body.oobDomain);
+  if (body.oobHttp) args.push('--oob-http', body.oobHttp);
+  if (body.oobDns) args.push('--oob-dns', body.oobDns);
+  if (body.sms) args.push('--sms', body.sms);
+  if (body.typesafe) args.push('--typesafe', body.typesafe);
+  if (body.intercept && body.intercept !== 'off') args.push('--intercept', body.intercept);
+  if (body.sandbox) args.push('--sandbox', body.sandbox === 'default' ? '' : body.sandbox);
+  if (body.revalidatePoc) args.push('--revalidate-poc');
+  for (const fw of body.compliance || []) args.push('--compliance', fw);
+  // Authorization: the signed grant caps the scope, the extra in-scope entries
+  // can only narrow within it, and the environment scales every risk score.
+  for (const entry of body.inScope || []) args.push('--in-scope', entry);
+  if (body.scopePath) args.push('--scope-file', body.scopePath);
+  if (body.capability) args.push('--capability-token', body.capability);
+  if (body.environment) args.push('--environment', body.environment);
+  if (body.policyProfile) args.push('--policy', body.policyProfile);
   for (const a of body.agents || []) args.push('--only', a);
   args.push('--verbose');
   return args;
@@ -541,7 +730,8 @@ async function startJob(body) {
   if (!BIN) throw new Error('neurosploit binary not found — run `cargo build --release` in neurosploit-rs/');
   const id = crypto.randomUUID();
   const credsPath = await materializeCreds(body, id);
-  const args = buildArgs({ ...body, creds: credsPath });
+  const scopePath = await materializeScope(body, id);
+  const args = buildArgs({ ...body, creds: credsPath, scopePath });
   const job = new Job(id, BIN, args, body.repo || body.target || '', body.name || '');
   job.pinnedAgents = body.agents || [];
   jobs.set(id, job);
@@ -579,6 +769,62 @@ async function startJob(body) {
 /// engagement (`/target`/`/repo` → `/model` → toggles → `/only` → `/run`).
 /// `/only` is what makes this equivalent to the CLI's `--only` — REPL had no
 /// such command before this feature (added to app/src/repl.rs alongside it).
+/// Flags that apply to every mode, including the REPL-backed one. The REPL
+/// takes them as argv because a `/`-command for an authorization ceiling would
+/// let the session widen its own grant mid-run.
+function authArgs(body) {
+  const args = [];
+  for (const entry of body.inScope || []) args.push('--in-scope', entry);
+  if (body.scopePath) args.push('--scope-file', body.scopePath);
+  if (body.capability) args.push('--capability-token', body.capability);
+  if (body.environment) args.push('--environment', body.environment);
+  if (body.policyProfile) args.push('--policy', body.policyProfile);
+  // Egress and the OOB channel are launcher-level, like the grant: a session
+  // must not be able to re-route its own traffic once it is running.
+  if (body.transport && body.transport !== 'direct') args.push('--transport', body.transport);
+  if (body.oobDomain) args.push('--oob-domain', body.oobDomain);
+  if (body.oobHttp) args.push('--oob-http', body.oobHttp);
+  if (body.oobDns) args.push('--oob-dns', body.oobDns);
+  if (body.sms) args.push('--sms', body.sms);
+  if (body.typesafe) args.push('--typesafe', body.typesafe);
+  if (body.intercept && body.intercept !== 'off') args.push('--intercept', body.intercept);
+  if (body.sandbox) args.push('--sandbox', body.sandbox === 'default' ? '' : body.sandbox);
+  if (body.revalidatePoc) args.push('--revalidate-poc');
+  for (const fw of body.compliance || []) args.push('--compliance', fw);
+  if (body.budget && body.budget !== 'unlimited') args.push('--budget', body.budget);
+  if (body.tokenLimit) args.push('--token-limit', String(body.tokenLimit));
+  if (body.deepTestLimit) args.push('--deep-test-limit', String(body.deepTestLimit));
+  if (body.order === 'depth-first') args.push('--depth-first');
+  else if (body.order === 'coverage-first') args.push('--coverage-first');
+  if (body.samplePerRoute) args.push('--sample-per-route', String(body.samplePerRoute));
+  return args;
+}
+
+/// The non-secret subset of a launch body, kept so a job can be relaunched
+/// after a server restart. API keys live only in memory (apiKeys) and creds
+/// files on disk; neither is copied here.
+function sanitizeLaunch(body) {
+  return {
+    mode: body.mode || 'run',
+    target: body.target || '',
+    repo: body.repo || '',
+    models: body.models || [],
+    subscription: !!body.subscription,
+    mcp: !!body.mcp,
+    votes: body.votes,
+    chainDepth: body.chainDepth,
+    recon: body.recon,
+    focus: body.focus,
+    objective: body.objective,
+    outOfScope: body.outOfScope,
+    agents: body.agents || [],
+    name: body.name || '',
+    sandbox: !!body.sandbox,
+    typesafe: body.typesafe,
+    quick: !!body.quick,
+  };
+}
+
 function buildReplScript(body) {
   const lines = [];
   if (body.mode === 'whitebox') lines.push(`/repo ${body.repo || body.target}`);
@@ -597,6 +843,8 @@ function buildReplScript(body) {
   if (body.outOfScope) lines.push(`/scope-out ${body.outOfScope}`);
   if (body.creds) lines.push(`/creds ${body.creds}`);
   lines.push((body.agents || []).length ? `/only ${body.agents.join(',')}` : '/only clear');
+  // Economy preset last, so it wins over the per-knob settings above.
+  if (body.quick) lines.push('/quick');
   lines.push('/run');
   return lines;
 }
@@ -614,12 +862,21 @@ async function startJobViaRepl(body) {
   const id = crypto.randomUUID();
   const credsPath = await materializeCreds(body, id);
   const script = buildReplScript({ ...body, creds: credsPath });
-  const job = new Job(id, BIN, [], body.repo || body.target || '', body.name || '');
+  const scopePath = await materializeScope(body, id);
+  const auth = authArgs({ ...body, scopePath });
+  const job = new Job(id, BIN, auth, body.repo || body.target || '', body.name || '');
   job.pinnedAgents = body.agents || [];
   job.repl = true;
+  // Non-secret params needed to relaunch this job after a restart. No API keys,
+  // no creds-file contents — only what rebuilds the engagement shape so a
+  // resumed REPL can `/continue` the harness checkpoint.
+  job.launch = sanitizeLaunch(body);
   jobs.set(id, job);
+  persistJob(job);
 
-  const child = spawn(BIN, [], { cwd: ROOT, env: { ...process.env, ...envOverrides() } });
+  // The REPL session inherits the engagement's authorization from argv, so the
+  // ceiling is set before the first command is scripted into it.
+  const child = spawn(BIN, auth, { cwd: ROOT, env: { ...process.env, ...envOverrides() } });
   job.child = child;
   let buf = '';
   const onData = (chunk) => {
@@ -649,9 +906,103 @@ async function startJobViaRepl(body) {
   return job;
 }
 
+/// Relaunch an interrupted REPL-backed job in place: spawn a fresh REPL over a
+/// pipe, which (a) restores the project session (model/subscription) and (b)
+/// auto-recovers the harness's on-disk checkpoint and `/continue`s it, carrying
+/// the prior findings forward. We reuse the SAME job object (id, feed,
+/// findings) so the browser's live view simply resumes streaming.
+function relaunchJobViaRepl(job) {
+  const launch = job.launch || {};
+  const auth = authArgs(launch);
+  job.repl = true;
+  job.done = false;
+  job.exitCode = null;
+  job.interrupted = false;
+  job.phase = 'resuming';
+  job.push({ type: 'log', line: '[web] resuming — recovering the on-disk checkpoint and continuing…' });
+
+  const child = spawn(BIN, auth, { cwd: ROOT, env: { ...process.env, ...envOverrides(), NEUROSPLOIT_AUTO_RESUME: '1' } });
+  job.child = child;
+  let buf = '';
+  const onData = (chunk) => {
+    buf += chunk.toString('utf8');
+    let idx;
+    while ((idx = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+      if (line.length) ingestLine(job, line);
+    }
+  };
+  child.stdout.on('data', onData);
+  child.stderr.on('data', onData);
+  child.on('close', (code) => {
+    if (buf.trim()) ingestLine(job, buf);
+    if (!job.done) { job.done = true; job.push({ type: 'done', exitCode: code }); }
+    job.exitCode = code;
+  });
+  child.on('error', (err) => {
+    job.done = true;
+    job.push({ type: 'log', line: `[web] failed to resume neurosploit: ${err.message}` });
+    job.push({ type: 'done', exitCode: -1 });
+  });
+  // Re-apply the engagement shape, then continue. Over a pipe the REPL also
+  // auto-continues on its own; a second /continue while working is a harmless
+  // no-op. Sending the settings first makes the resumed run deterministic even
+  // if the saved session was stale.
+  const script = [];
+  if (launch.subscription !== undefined) script.push(`/sub ${launch.subscription ? 'on' : 'off'}`);
+  if ((launch.models || []).length) script.push(`/model ${launch.models.join(',')}`);
+  script.push('/continue');
+  for (const line of script) child.stdin.write(line + '\n');
+  persistJob(job);
+  return job;
+}
+
+/// Rebuild the in-memory job list from disk on startup. A job that was still
+/// running when the server stopped is marked interrupted (and resumable when it
+/// was a REPL-backed run/whitebox/greybox job, since only those have the
+/// harness checkpoint + /continue path).
+function loadPersistedJobs() {
+  let files = [];
+  try { files = fs.readdirSync(JOBS_DIR).filter((f) => f.endsWith('.json')); } catch { return; }
+  for (const f of files) {
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(path.join(JOBS_DIR, f), 'utf8')); } catch { continue; }
+    if (!rec || !rec.id) continue;
+    const job = new Job(rec.id, BIN, [], rec.target || '', rec.name || '');
+    job.runId = rec.runId || null;
+    job.findings = rec.findings || [];
+    job.agents = rec.agents || 0;
+    job.agentsDone = rec.agentsDone || 0;
+    job.reportUrl = rec.reportUrl || null;
+    job.startedAt = rec.startedAt || Date.now();
+    job.repl = !!rec.interactive;
+    job.launch = rec.launch || null;
+    job.feed = rec.feedTail || [];
+    job.child = null;
+    if (rec.done) {
+      job.done = true;
+      job.phase = rec.phase || 'complete';
+    } else {
+      // The server died while this was live. It can't still be running.
+      job.done = false;
+      job.interrupted = true;
+      job.phase = 'interrupted';
+      const m = (rec.launch && rec.launch.mode) || 'run';
+      job.resumable = job.repl && ['run', 'whitebox', 'greybox'].includes(m);
+    }
+    jobs.set(job.id, job);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // REPL sessions — spawn `neurosploit` with no subcommand (Reader::Plain kicks
 // in over a piped stdin) and forward stdin/stdout verbatim: a real REPL.
+//
+// The stream is NOT ANSI-stripped: the browser renders it in xterm.js, which
+// is the same terminal emulator a local shell would drive, so colour, cursor
+// moves and the harness's own spinners arrive intact. Stripping here would
+// hand the emulator a degraded copy of what the CLI actually printed.
 // ---------------------------------------------------------------------------
 
 const replSessions = new Map();
@@ -663,10 +1014,17 @@ class ReplSession extends EventEmitter {
     this.child = child;
     this.done = false;
     this.buffer = [];
+    this.bytes = 0;
   }
   push(chunk) {
     this.buffer.push(chunk);
-    if (this.buffer.length > 5000) this.buffer.shift();
+    this.bytes += chunk.length;
+    // Bound the replay buffer by size, not chunk count: one chunk can be a
+    // single keystroke echo or a whole recon dump, so counting chunks caps
+    // memory nowhere near where it's meant to.
+    while (this.bytes > 512_000 && this.buffer.length > 1) {
+      this.bytes -= this.buffer.shift().length;
+    }
     this.emit('data', chunk);
   }
 }
@@ -674,20 +1032,28 @@ class ReplSession extends EventEmitter {
 function startRepl() {
   if (!BIN) throw new Error('neurosploit binary not found — run `cargo build --release` in neurosploit-rs/');
   const id = crypto.randomUUID();
-  const child = spawn(BIN, [], { cwd: ROOT, env: { ...process.env, ...envOverrides() } });
+  const child = spawn(BIN, [], {
+    cwd: ROOT,
+    // Without TERM the harness assumes a dumb terminal and drops colour; the
+    // browser side is a full xterm, so say so.
+    env: { ...process.env, ...envOverrides(), TERM: 'xterm-256color' },
+  });
   const session = new ReplSession(id, child);
   replSessions.set(id, session);
-  const onData = (chunk) => session.push(stripAnsi(chunk.toString('utf8')));
-  child.stdout.on('data', onData);
-  child.stderr.on('data', onData);
+  // One decoder per stream: a chunk boundary can land mid-UTF-8-sequence, and
+  // decoding each chunk independently would emit replacement characters.
+  const decOut = new StringDecoder('utf8');
+  const decErr = new StringDecoder('utf8');
+  child.stdout.on('data', (c) => session.push(decOut.write(c)));
+  child.stderr.on('data', (c) => session.push(decErr.write(c)));
   child.on('close', (code) => {
     session.done = true;
-    session.push(`\n[repl session ended, exit code ${code}]\n`);
+    session.push(`\r\n\x1b[2m[repl session ended, exit code ${code}]\x1b[0m\r\n`);
     session.emit('close');
   });
   child.on('error', (err) => {
     session.done = true;
-    session.push(`\n[failed to start neurosploit: ${err.message}]\n`);
+    session.push(`\r\n\x1b[31m[failed to start neurosploit: ${err.message}]\x1b[0m\r\n`);
     session.emit('close');
   });
   return session;
@@ -832,6 +1198,18 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && m) {
       return serveRunAsset(req, res, decodeURIComponent(m[1]), decodeURIComponent(m[2]));
     }
+    // Delete ALL runs (must come before the single-run matcher below).
+    if (req.method === 'DELETE' && p === '/api/runs') {
+      const n = await deleteAllRuns();
+      return sendJson(res, 200, { ok: true, deleted: n });
+    }
+    m = p.match(/^\/api\/runs\/([^/]+)$/);
+    if (req.method === 'DELETE' && m) {
+      const id = decodeURIComponent(m[1]);
+      const ok = await deleteRun(id);
+      if (!ok) return sendJson(res, 404, { error: 'run not found' });
+      return sendJson(res, 200, { ok: true, deleted: 1, id });
+    }
 
     // ---- exploitation jobs ----
     if (req.method === 'GET' && p === '/api/exploit') {
@@ -853,6 +1231,26 @@ const server = http.createServer(async (req, res) => {
       if (!job) return sendJson(res, 404, { error: 'job not found' });
       return sendJson(res, 200, job.snapshot());
     }
+    m = p.match(/^\/api\/exploit\/([^/]+)\/resume$/);
+    if (req.method === 'POST' && m) {
+      const job = jobs.get(m[1]);
+      if (!job) return sendJson(res, 404, { error: 'job not found' });
+      if (!job.interrupted) return sendJson(res, 409, { error: 'this job is not interrupted — nothing to resume' });
+      if (!job.resumable) return sendJson(res, 409, { error: 'this job cannot be resumed (only run/whitebox/greybox engagements checkpoint)' });
+      if (!BIN) return sendJson(res, 500, { error: 'neurosploit binary not found' });
+      // API-key jobs need their provider key back after a server restart; it
+      // lived only in memory. Subscription jobs need no key.
+      const launch = job.launch || {};
+      if (!launch.subscription) {
+        const provs = (launch.models || []).map((m2) => String(m2).split(':')[0]);
+        const missing = provs.filter((pr) => PROVIDERS.some((P) => P.key === pr) && !apiKeys.get(pr) && !process.env[(PROVIDERS.find((P) => P.key === pr) || {}).envKey]);
+        if (missing.length) {
+          return sendJson(res, 409, { error: `set the API key for ${[...new Set(missing)].join(', ')} again (it is kept only in memory), then resume` });
+        }
+      }
+      relaunchJobViaRepl(job);
+      return sendJson(res, 200, { ok: true, id: job.id, interactive: true });
+    }
     m = p.match(/^\/api\/exploit\/([^/]+)\/stop$/);
     if (req.method === 'POST' && m) {
       const job = jobs.get(m[1]);
@@ -867,6 +1265,36 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJson(res, 200, { ok: true });
     }
+    // Pause / resume / report-where-it-stopped. All three are REPL commands,
+    // so they only exist on a REPL-backed job — a one-shot CLI subprocess has
+    // no stdin listener to take them.
+    m = p.match(/^\/api\/exploit\/([^/]+)\/(pause|continue|report)$/);
+    if (req.method === 'POST' && m) {
+      const job = jobs.get(m[1]);
+      if (!job) return sendJson(res, 404, { error: 'job not found' });
+      if (!job.repl || !job.child?.stdin?.writable) {
+        return sendJson(res, 409, { error: 'this job is not an interactive session — pause/continue/report need a REPL-backed run (run, whitebox or greybox)' });
+      }
+      const cmd = { pause: '/pause', continue: '/continue', report: '/report' }[m[2]];
+      job.child.stdin.write(cmd + '\n');
+      if (m[2] === 'pause') job.phase = 'paused (operator)';
+      else if (m[2] === 'continue' && job.phase.startsWith('paused')) job.phase = 'resuming';
+      return sendJson(res, 200, { ok: true, sent: cmd });
+    }
+
+    // The whole log, as text — for downloading or pasting into a ticket.
+    m = p.match(/^\/api\/exploit\/([^/]+)\/log$/);
+    if (req.method === 'GET' && m) {
+      const job = jobs.get(m[1]);
+      if (!job) return sendJson(res, 404, { error: 'job not found' });
+      const body = job.feed.filter((e) => e.type === 'log').map((e) => e.line).join('\n') + '\n';
+      res.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8',
+        'content-disposition': `attachment; filename="neurosploit-${job.runId || job.id}.log"`,
+      });
+      return res.end(body);
+    }
+
     m = p.match(/^\/api\/exploit\/([^/]+)\/input$/);
     if (req.method === 'POST' && m) {
       const job = jobs.get(m[1]);
@@ -904,7 +1332,18 @@ const server = http.createServer(async (req, res) => {
       const session = replSessions.get(m[1]);
       if (!session) return sendJson(res, 404, { error: 'session not found' });
       const body = await readBody(req);
-      session.child.stdin.write(String(body.line ?? '') + '\n');
+      // `data` is raw (whatever the terminal captured); `line` is the older
+      // line-oriented form and still gets its newline appended here.
+      const raw = body.data != null ? String(body.data) : String(body.line ?? '') + '\n';
+      // Ctrl-C over a pipe is not a signal — nothing turns byte 0x03 into
+      // SIGINT when there is no tty in between, so the interrupt has to be
+      // delivered explicitly or it would silently do nothing.
+      if (raw.includes('\x03')) {
+        session.child.kill('SIGINT');
+        return sendJson(res, 200, { ok: true, signalled: 'SIGINT' });
+      }
+      if (!session.child.stdin.writable) return sendJson(res, 409, { error: 'session has ended' });
+      session.child.stdin.write(raw);
       return sendJson(res, 200, { ok: true });
     }
     m = p.match(/^\/api\/repl\/([^/]+)\/stop$/);
@@ -930,8 +1369,45 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ---- report rebuild (generate/refresh the PDF for a finished run) ----
+    m = p.match(/^\/api\/runs\/([^/]+)\/report$/);
+    if (req.method === 'POST' && m) {
+      const id = decodeURIComponent(m[1]);
+      const dir = safeRunDir(id);
+      if (!dir || !fs.existsSync(dir)) return sendJson(res, 404, { error: 'run not found' });
+      if (!BIN) return sendJson(res, 500, { error: 'neurosploit binary not found — run `cargo build --release` in neurosploit-rs/' });
+      // The harness owns report generation (Typst template, severity ordering,
+      // the evidence sections); shelling out to it keeps one implementation
+      // instead of a second, drifting one in JavaScript.
+      const out = await new Promise((resolve) => {
+        const child = spawn(BIN, ['rebuild', dir], { cwd: ROOT, env: { ...process.env, ...envOverrides() } });
+        let buf = '';
+        child.stdout.on('data', (c) => { buf += c.toString('utf8'); });
+        child.stderr.on('data', (c) => { buf += c.toString('utf8'); });
+        child.on('close', (code) => resolve({ code, buf }));
+        child.on('error', (e) => resolve({ code: -1, buf: e.message }));
+      });
+      const built = ['report.pdf', 'report.html', 'report.md', 'report.json'].filter((f) => fs.existsSync(path.join(dir, f)));
+      if (out.code !== 0 && !built.includes('report.pdf')) {
+        return sendJson(res, 502, { error: stripAnsi(out.buf).trim() || 'rebuild failed', built });
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        built,
+        // Typst is optional; saying so beats handing back a link to a file that
+        // was never produced.
+        pdf: built.includes('report.pdf'),
+        note: built.includes('report.pdf') ? '' : 'PDF needs the `typst` binary on PATH — the HTML and Markdown reports were rebuilt.',
+      });
+    }
+
+    // ---- aggregate stats for the dashboard ----
+    if (req.method === 'GET' && p === '/api/stats') {
+      return sendJson(res, 200, await stats());
+    }
+
     if (req.method === 'GET' && p === '/api/meta') {
-      return sendJson(res, 200, { version: '4.0.0', binary: BIN, root: ROOT });
+      return sendJson(res, 200, { version: '4.2.1', binary: BIN, root: ROOT });
     }
 
     // ---- providers / API keys (in-memory only, never persisted) ----
@@ -962,9 +1438,13 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+loadPersistedJobs();
+
 server.listen(PORT, () => {
-  console.log(`NeuroSploit v4.0.0 web console → http://localhost:${PORT}`);
+  console.log(`NeuroSploit v4.2.1 web console → http://localhost:${PORT}`);
   console.log(`  binary : ${BIN || '(not found — build neurosploit-rs first)'}`);
   console.log(`  agents : ${AGENTS_DIR}`);
   console.log(`  runs   : ${RUNS_DIR}`);
+  const resumable = [...jobs.values()].filter((j) => j.interrupted && j.resumable).length;
+  if (resumable) console.log(`  jobs   : ${resumable} interrupted run(s) can be resumed`);
 });

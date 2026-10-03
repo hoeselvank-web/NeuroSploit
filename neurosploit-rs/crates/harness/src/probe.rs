@@ -91,13 +91,38 @@ pub struct Probe {
     pub notes: Vec<String>,
 }
 
+/// The harness's HTTP client: identifying User-Agent, proxy honoured, and
+/// invalid certificates tolerated (test targets rarely have valid ones).
+/// Shared with `crate::replay` so every request the harness itself makes is
+/// shaped the same way and is attributable to NeuroSploit.
+pub fn http_client() -> reqwest::Client {
+    client()
+}
+
 fn client() -> reqwest::Client {
     let ua = std::env::var("NEUROSPLOIT_UA").ok().filter(|v| !v.trim().is_empty())
         .unwrap_or_else(crate::pipeline::default_user_agent);
+    // Redirects are followed, but a redirect to a private/loopback address is
+    // refused — that is the SSRF-redirect-to-internal pivot, and reqwest would
+    // otherwise chase it off the authorized surface. Normal cross-host
+    // redirects between public hosts are still followed (the scope layer judges
+    // the findings; this only stops the network-level pivot).
+    let redirect = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.stop();
+        }
+        let host = crate::netguard::normalize_host(attempt.url().host_str().unwrap_or(""));
+        if let Some(ip) = crate::netguard::parse_ip_any(&host) {
+            if crate::netguard::is_private(&ip) {
+                return attempt.stop();
+            }
+        }
+        attempt.follow()
+    });
     let mut b = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(redirect)
         .user_agent(ua);
     if let Ok(p) = std::env::var("NEUROSPLOIT_PROXY") {
         if !p.trim().is_empty() {
@@ -212,6 +237,27 @@ fn parse_forms(body: &str) -> Vec<FormInfo> {
 }
 
 /// Run the probe. Never panics; on total failure returns a Probe with a note.
+/// Probe a target after checking it against the engagement's boundary.
+///
+/// This is the harness's own network chokepoint: it is the one place the
+/// harness itself sends requests, so the guard runs here rather than trusting
+/// the caller. An out-of-scope target yields an empty probe with a note, not a
+/// request.
+pub async fn probe_in_scope(target: &str, policy: &crate::scope::ScopePolicy) -> Probe {
+    let d = policy.check(target, crate::scope::Action::Probe);
+    if !d.allowed() {
+        let mut p = Probe::default();
+        p.notes.push(format!("scope guard blocked the probe: {}", d.reason()));
+        return p;
+    }
+    if let crate::scope::Decision::Warn(w) = d {
+        let mut p = probe(target).await;
+        p.notes.push(format!("scope guard: {w}"));
+        return p;
+    }
+    probe(target).await
+}
+
 pub async fn probe(target: &str) -> Probe {
     let mut p = Probe { url: target.to_string(), ..Default::default() };
     let c = client();

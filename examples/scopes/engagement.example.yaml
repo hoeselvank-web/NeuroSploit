@@ -1,0 +1,68 @@
+# ===========================================================================
+# NeuroSploit scope config — direct engagement (TEMPLATE)
+# ---------------------------------------------------------------------------
+# For a normal pentest where you have WRITTEN AUTHORIZATION from the asset
+# owner (a signed SOW / contract / authorization letter) — no bug-bounty
+# program or HackerOne needed. You, the operator, assert you are authorized
+# for everything in `hard` below. Fill it from the engagement's authorization.
+#
+# You usually don't even need this file: in the REPL just run
+#     /authorize app.client.com *.client.com 10.0.0.0/24
+# or on the CLI
+#     neurosploit run app.client.com --in-scope "*.client.com" --in-scope 10.0.0.0/24
+# Use this file when the scope is large or you want it version-controlled with
+# the engagement notes.
+#
+# HARD scope is the one thing you MUST set — it is the safety boundary (a host
+# not covered here is refused before any request leaves). Everything else
+# (rate, accounts, destructive verbs) is YOURS to tune for THIS engagement.
+# ===========================================================================
+
+# --- HARD: everything you are authorized to test. -------------------------
+hard:
+  - app.client.example               # a single host
+  - "*.client.example"               # apex + all subdomains
+  - 10.0.0.0/24                      # an internal range (reach it with --transport)
+  - https://api.client.example/v2    # or just one URL prefix
+
+# --- EXCLUDE: anything carved out of the authorization. -------------------
+exclude:
+  # - billing.client.example
+  # - "*.prod.client.example"        # e.g. test staging only
+
+# --- SOFT: guardrails — tune these to the engagement's rules. -------------
+soft:
+  # Look-only hosts (recon, no payloads) — e.g. shared/third-party infra.
+  observe_only: []
+
+  # Direct engagements often authorize more than a bounty would. Set these to
+  # what the SOW allows:
+  allow_destructive_methods: false   # true only if the authorization covers it (e.g. a staging env)
+  allow_account_creation: true       # create test accounts to reach authed surface
+  max_accounts: 3
+  max_requests_per_minute: 240       # raise for a lab / internal test, lower for fragile prod
+
+  # Hard stops regardless of authorization — things that destroy data or DoS.
+  forbidden_payloads:
+    - "drop table"
+    - "truncate table"
+    - "delete from"
+    - "rm -rf /"
+    - "shutdown"
+    - "while(true)"
+
+  notes:
+    - "Authorized under <SOW / contract reference>; owner contact: <email/phone>."
+    - "Test window: <when>. Notify <contact> before any high-impact test."
+
+# --- Optional: define the rest of the engagement in this one file -----------
+# These top-level keys are read by `/scope-file` (the CLI --scope-file reads only
+# the scope). All optional. A wildcard target is seeded from its apex.
+target: "*.client.example"
+# models:
+#   - anthropic:claude-opus-5-5
+#   - openai:gpt-6-astra
+# classes: idor, sqli, xss, ssrf, auth     # pin specific vuln classes (optional)
+objective: "Comprehensive black-box web application penetration test following OWASP Top 10 (2021), OWASP ASVS, the OWASP WSTG and CWE."
+focus: "Cover the full web attack surface and prove impact: map every route/endpoint/parameter from the app and its JS bundles, then test each applicable class — injection (SQL/NoSQL/command/SSTI/LDAP/XPath), XSS (reflected/stored/DOM), access control (IDOR/BOLA/BFLA/privesc/forced browsing), authentication & session (login, signup, password reset, MFA, OAuth/OIDC/SAML, JWT alg/kid/jku), SSRF, XXE, insecure deserialization, CSRF, open redirect, CORS, file upload/download & path traversal, business-logic & multi-step flow abuse, mass assignment, request smuggling, info disclosure & security misconfiguration, cryptographic failures, and known-CVE components. Prioritise the authenticated surface and less-hardened subdomains, chain footholds into higher impact, and confirm every finding with a reproducible request/response receipt."
+authorization: "<SOW / contract reference, or a program URL>"

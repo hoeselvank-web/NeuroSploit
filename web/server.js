@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * NeuroSploit v4.2.1 — web console backend.
+ * NeuroSploit v4.3.2 — web console backend.
  *
  * Zero-dependency Node HTTP server that:
  *  - serves the static SPA in ./public
@@ -19,7 +19,7 @@ const fs = require('node:fs');
 const fsp = fs.promises;
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const { StringDecoder } = require('node:string_decoder');
@@ -57,6 +57,22 @@ function saveEngagementName(runId, name) {
 // interrupted run/whitebox/greybox job, RESUME it (relaunch the REPL, which
 // auto-recovers the harness's own on-disk checkpoint and carries findings
 // forward). Secrets (API keys, creds-file contents) are never written here.
+const CONFIG_DIR = path.join(ROOT, '.neurosploit');
+function configFile(name) { return path.join(CONFIG_DIR, `${name}.json`); }
+async function ensureConfigDir() { await fsp.mkdir(CONFIG_DIR, { recursive: true }); }
+async function readConfig(name) {
+  try { return JSON.parse(await fsp.readFile(configFile(name), 'utf8')); }
+  catch { return []; }
+}
+async function readConfigObj(name) {
+  try { return JSON.parse(await fsp.readFile(configFile(name), 'utf8')); }
+  catch { return {}; }
+}
+async function writeConfig(name, data) {
+  await ensureConfigDir();
+  await fsp.writeFile(configFile(name), JSON.stringify(data, null, 2));
+}
+
 const JOBS_DIR = path.join(ROOT, '.neurosploit', 'web-jobs');
 function jobFile(id) { return path.join(JOBS_DIR, `${id}.json`); }
 function persistJob(job) {
@@ -89,6 +105,21 @@ function findBinary() {
 }
 const BIN = findBinary();
 
+// The console version is whatever the compiled CLI reports — never a hardcoded
+// string. This keeps the web UI and the CLI binary in lockstep: bump the crate,
+// rebuild, and the title/badge/UA all move together with no web edit. Falls back
+// to the package string only when the binary is missing.
+const FALLBACK_VERSION = '4.3.1';
+function binaryVersion() {
+  if (!BIN) return FALLBACK_VERSION;
+  try {
+    const out = execFileSync(BIN, ['--version'], { encoding: 'utf8', timeout: 5000 });
+    const m = out.match(/\b(\d+\.\d+\.\d+(?:[-+][\w.]+)?)\b/);
+    return (m && m[1]) || FALLBACK_VERSION;
+  } catch { return FALLBACK_VERSION; }
+}
+const VERSION = binaryVersion();
+
 const PORT = Number(process.env.NEUROSPLOIT_WEB_PORT || process.env.PORT || 4173);
 
 // ---------------------------------------------------------------------------
@@ -102,7 +133,7 @@ const PORT = Number(process.env.NEUROSPLOIT_WEB_PORT || process.env.PORT || 4173
 
 const PROVIDERS = [
   { key: 'anthropic', label: 'Anthropic Claude', kind: 'cli', envKey: 'ANTHROPIC_API_KEY',
-    models: ['claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
+    models: ['claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-opus-4-8', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
   { key: 'openai', label: 'OpenAI (ChatGPT)', kind: 'cli', envKey: 'OPENAI_API_KEY',
     models: ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2', 'gpt-5.1', 'gpt-5.1-codex', 'o4'] },
   { key: 'xai', label: 'xAI Grok', kind: 'cli', envKey: 'XAI_API_KEY',
@@ -121,8 +152,11 @@ const PROVIDERS = [
     models: ['mistral-large-latest', 'codestral-latest'] },
   { key: 'qwen', label: 'Qwen (DashScope)', kind: 'api', envKey: 'DASHSCOPE_API_KEY',
     models: ['qwen3.8-max', 'qwen3.8-omni-flash', 'qwen-max', 'qwen2.5-coder-32b-instruct', 'qwq-plus'] },
+  // Z.ai GLM: always needs a ZAI_API_KEY (so kind:'api' keeps the key field),
+  // but with the subscription toggle on it runs agentically through the Claude
+  // Code CLI pointed at Z.ai's Anthropic-compatible endpoint (devpack/cline).
   { key: 'zai', label: 'Z.ai (GLM)', kind: 'api', envKey: 'ZAI_API_KEY',
-    models: ['glm-5.3', 'glm-5.3-flashx', 'glm-4.6'] },
+    models: ['glm-5.3', 'glm-5.2', 'glm-5.1', 'glm-5.3-flashx', 'glm-4.6'] },
   { key: 'groq', label: 'Groq', kind: 'api', envKey: 'GROQ_API_KEY',
     models: ['llama-3.3-70b-versatile', 'qwen-2.5-coder-32b'] },
   { key: 'together', label: 'Together AI', kind: 'api', envKey: 'TOGETHER_API_KEY',
@@ -144,11 +178,75 @@ const PROVIDERS = [
 // In-memory only — never written to disk. Cleared on server restart.
 const apiKeys = new Map(); // provider key -> secret
 
+// A cheap authenticated endpoint per provider, to confirm a key works. GET a
+// models/account list — a 200 means the key authenticates, 401/403 means it does
+// not. Providers without a reachable check (local/proxy, or no public endpoint)
+// return ok:null — the key is saved, just not auto-verified.
+function keyProbe(provider, key) {
+  const bearer = { Authorization: `Bearer ${key}` };
+  switch (provider) {
+    case 'anthropic': return { url: 'https://api.anthropic.com/v1/models', headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } };
+    case 'openai': return { url: 'https://api.openai.com/v1/models', headers: bearer };
+    case 'xai': return { url: 'https://api.x.ai/v1/models', headers: bearer };
+    case 'gemini': return { url: `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`, headers: {} };
+    case 'deepseek': return { url: 'https://api.deepseek.com/models', headers: bearer };
+    case 'mistral': return { url: 'https://api.mistral.ai/v1/models', headers: bearer };
+    case 'groq': return { url: 'https://api.groq.com/openai/v1/models', headers: bearer };
+    case 'together': return { url: 'https://api.together.xyz/v1/models', headers: bearer };
+    case 'openrouter': return { url: 'https://openrouter.ai/api/v1/key', headers: bearer };
+    case 'moonshot': return { url: 'https://api.moonshot.ai/v1/models', headers: bearer };
+    case 'qwen': return { url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models', headers: bearer };
+    case 'nvidia_nim': return { url: 'https://integrate.api.nvidia.com/v1/models', headers: bearer };
+    case 'zai': return { url: 'https://api.z.ai/api/paas/v4/models', headers: bearer };
+    default: return null; // opencode, nous, litellm, azure, ollama, llamacpp — not auto-verifiable here
+  }
+}
+
+async function verifyKey(provider, key) {
+  const probe = keyProbe(provider, key);
+  if (!probe) return { ok: null, message: 'saved — this provider is not auto-verifiable here' };
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    const r = await fetch(probe.url, { headers: probe.headers, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+    if (r.ok) return { ok: true, message: 'key is valid' };
+    if (r.status === 401 || r.status === 403) return { ok: false, message: `key rejected (HTTP ${r.status})` };
+    if (r.status === 429) return { ok: true, message: 'key valid (rate-limited)' };
+    return { ok: null, message: `saved — provider returned HTTP ${r.status}` };
+  } catch (e) {
+    return { ok: null, message: `saved — could not reach provider (${e.name === 'AbortError' ? 'timeout' : e.message})` };
+  }
+}
+
 function envOverrides() {
   const env = {};
   for (const [key, secret] of apiKeys) {
     const p = PROVIDERS.find((x) => x.key === key);
     if (p && secret) env[p.envKey] = secret;
+  }
+  return env;
+}
+
+async function cloudEnvOverrides(cloudProvider) {
+  if (!cloudProvider) return {};
+  const integs = await readConfig('integrations');
+  const cfg = (integs.find(i => i.id === cloudProvider) || {}).config || {};
+  const env = {};
+  if (cloudProvider === 'aws') {
+    if (cfg.accesskey) env.AWS_ACCESS_KEY_ID = cfg.accesskey;
+    if (cfg.secretkey) env.AWS_SECRET_ACCESS_KEY = cfg.secretkey;
+    if (cfg.region) env.AWS_DEFAULT_REGION = cfg.region;
+    if (cfg.profile) env.AWS_PROFILE = cfg.profile;
+    if (cfg.rolearn) env.AWS_ROLE_ARN = cfg.rolearn;
+  } else if (cloudProvider === 'gcp') {
+    if (cfg.serviceaccount) env.GOOGLE_APPLICATION_CREDENTIALS = cfg.serviceaccount;
+    if (cfg.project) env.GCP_PROJECT = cfg.project;
+    if (cfg.region) env.CLOUDSDK_COMPUTE_REGION = cfg.region;
+  } else if (cloudProvider === 'azure') {
+    if (cfg.tenantid) env.AZURE_TENANT_ID = cfg.tenantid;
+    if (cfg.clientid) env.AZURE_CLIENT_ID = cfg.clientid;
+    if (cfg.clientsecret) env.AZURE_CLIENT_SECRET = cfg.clientsecret;
+    if (cfg.subscriptionid) env.AZURE_SUBSCRIPTION_ID = cfg.subscriptionid;
   }
   return env;
 }
@@ -217,6 +315,20 @@ async function materializeCreds(body, jobId) {
   await fsp.mkdir(dir, { recursive: true });
   const file = path.join(dir, `${jobId}.creds.yaml`);
   await fsp.writeFile(file, buildCredsYaml(body));
+  return file;
+}
+
+// An imported API collection (Postman/OpenAPI/HAR). The UI either uploads the
+// file content (collectionData) or points at a path already on disk
+// (collectionPath). Uploaded content is written to a temp file so the CLI's
+// --collection flag can read it.
+async function materializeCollection(body, jobId) {
+  if (body.collectionPath) return body.collectionPath; // path on disk wins
+  if (!body.collectionData) return undefined;
+  const dir = path.join(os.tmpdir(), 'neurosploit-web');
+  await fsp.mkdir(dir, { recursive: true });
+  const file = path.join(dir, `${jobId}.collection.json`);
+  await fsp.writeFile(file, body.collectionData);
   return file;
 }
 
@@ -434,6 +546,13 @@ async function listRuns() {
   } catch {
     return [];
   }
+  // Which run ids are actually driven by a LIVE job right now. A run whose
+  // status.json still says "running" but has no live job is stale (the process
+  // died / the server restarted) — show it as interrupted, not running, so the
+  // sidebar's Running group reflects reality.
+  const liveRunIds = new Set(
+    [...jobs.values()].filter((j) => !j.done && j.runId).map((j) => j.runId)
+  );
   const runs = await Promise.all(ids.map(async (id) => {
     const dir = path.join(RUNS_DIR, id);
     const [meta, status, findings] = await Promise.all([
@@ -445,17 +564,40 @@ async function listRuns() {
     const ts = tsMatch ? Number(tsMatch[1]) : 0;
     const sevCount = {};
     for (const f of findings) sevCount[f.severity] = (sevCount[f.severity] || 0) + 1;
+    let state = status.state || 'unknown';
+    if (state === 'running' && !liveRunIds.has(id)) state = 'interrupted';
     return {
       id,
       ts,
       name: engagementNames.get(id) || '',
       target: status.target || meta.target || id.replace(/^ns-\d+-/, ''),
-      state: status.state || 'unknown',
+      state,
       findings: findings.length,
       severities: sevCount,
       hasReport: fs.existsSync(path.join(dir, 'report.html')) || fs.existsSync(path.join(dir, 'report.pdf')),
     };
   }));
+  // A brand-new live job hasn't written its run dir yet (the run id is only
+  // known after recon prints it). Surface those in-memory running jobs so the
+  // engagement shows in the sidebar the moment it starts, not minutes later.
+  const onDisk = new Set(ids);
+  for (const j of jobs.values()) {
+    if (j.done) continue;
+    if (j.runId && onDisk.has(j.runId)) continue; // already covered above
+    const sevCount = {};
+    for (const f of j.findings || []) sevCount[f.severity] = (sevCount[f.severity] || 0) + 1;
+    runs.push({
+      id: j.runId || j.id,
+      jobId: j.id,
+      ts: Math.floor((j.startedAt || Date.now()) / 1000),
+      name: j.name || '',
+      target: j.target || '',
+      state: 'running',
+      findings: (j.findings || []).length,
+      severities: sevCount,
+      hasReport: false,
+    });
+  }
   runs.sort((a, b) => b.ts - a.ts);
   return runs;
 }
@@ -526,7 +668,223 @@ async function runDetail(id) {
   const assets = ['report.html', 'report.pdf', 'report.md', 'recon.md', 'exploitation.md', 'audit.jsonl', 'graph.json']
     .filter((f) => fs.existsSync(path.join(dir, f)));
   const pocs = await fsp.readdir(path.join(dir, 'pocs')).catch(() => []);
-  return { id, name: engagementNames.get(id) || '', meta, status, findings, assets, pocs };
+  // What the harness produced beyond the report: the attack graph, the shared
+  // traces, the recorded traffic, the deliverables. Presence only — the tabs
+  // fetch the content on demand.
+  const exists = (f) => fs.existsSync(path.join(dir, f));
+  const traces = await fsp.readdir(path.join(dir, 'traces')).catch(() => []);
+  const extras = {
+    graph: exists('graph/chains.json') || exists('graph/live-chains.json') || exists('graph/graph.json') || exists('graph/live.json'),
+    todo: exists('graph/todo.json'),
+    traces: traces.filter((f) => f.endsWith('.md')).length,
+    flows: exists('flows.jsonl'),
+    deliverables: await listTree(path.join(dir, 'deliverables'), 'deliverables'),
+  };
+  return { id, name: engagementNames.get(id) || '', meta, status, findings, assets, pocs, extras };
+}
+
+/// Relative file list under a directory (one level of nesting is enough for
+/// `deliverables/`: tests/, nuclei/, detection/).
+async function listTree(abs, rel, depth = 0) {
+  const out = [];
+  const ents = await fsp.readdir(abs, { withFileTypes: true }).catch(() => []);
+  for (const e of ents) {
+    if (e.isDirectory() && depth < 2) out.push(...await listTree(path.join(abs, e.name), `${rel}/${e.name}`, depth + 1));
+    else if (e.isFile()) out.push(`${rel}/${e.name}`);
+  }
+  return out.sort();
+}
+
+/// Run the real CLI against a run directory and capture its output. The web
+/// console never re-implements harness logic — it shells out, like `rebuild`.
+function runCli(args) {
+  return new Promise((resolve) => {
+    if (!BIN) return resolve({ code: -1, buf: 'neurosploit binary not found — run `cargo build --release` in neurosploit-rs/' });
+    const child = spawn(BIN, args, { cwd: ROOT, env: { ...process.env, ...envOverrides() } });
+    let buf = '';
+    child.stdout.on('data', (c) => { buf += c.toString('utf8'); });
+    child.stderr.on('data', (c) => { buf += c.toString('utf8'); });
+    child.on('close', (code) => resolve({ code, buf: stripAnsi(buf) }));
+    child.on('error', (e) => resolve({ code: -1, buf: e.message }));
+  });
+}
+
+/// The attack graph a run produced: chains, the dependency todolist and the
+/// graph itself. Live files (written during the run) win while it runs.
+async function runGraph(dir) {
+  const pick = async (...names) => {
+    for (const n of names) {
+      const v = await readJsonSafe(path.join(dir, n), null);
+      if (v) return v;
+    }
+    return null;
+  };
+  return {
+    chains: await pick('graph/live-chains.json', 'graph/chains.json'),
+    todo: await pick('graph/todo.json'),
+    graph: await pick('graph/live.json', 'graph/graph.json'),
+  };
+}
+
+/// The recording interceptor's log, filtered and paged.
+async function runTraffic(dir, q) {
+  const text = await fsp.readFile(path.join(dir, 'flows.jsonl'), 'utf8').catch(() => '');
+  let rows = text.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const hostOf = (u) => { try { return new URL(u).host; } catch { return String(u || '').split('/')[0]; } };
+  const hosts = [...new Set(rows.map((r) => hostOf(r.url)))].sort();
+  const host = (q.get('host') || '').trim().toLowerCase();
+  const method = (q.get('method') || '').trim().toUpperCase();
+  const needle = (q.get('q') || '').trim().toLowerCase();
+  if (host) rows = rows.filter((r) => hostOf(r.url).toLowerCase().includes(host));
+  if (method) rows = rows.filter((r) => (r.method || '').toUpperCase() === method);
+  if (needle) rows = rows.filter((r) => `${r.method} ${r.url} ${r.status} ${r.content_type}`.toLowerCase().includes(needle));
+  rows.reverse(); // newest first
+  const offset = Math.max(0, parseInt(q.get('offset') || '0', 10) || 0);
+  const limit = Math.min(500, Math.max(1, parseInt(q.get('limit') || '100', 10) || 100));
+  return { total: rows.length, hosts, rows: rows.slice(offset, offset + limit), offset, limit };
+}
+
+/// Search every agent's trace (the shared-trace store) for a keyword.
+async function searchTraces(dir, needle) {
+  const tdir = path.join(dir, 'traces');
+  const files = (await fsp.readdir(tdir).catch(() => [])).filter((f) => f.endsWith('.md')).sort();
+  const list = [];
+  const hits = [];
+  const n = (needle || '').trim().toLowerCase();
+  for (const f of files) {
+    const text = await fsp.readFile(path.join(tdir, f), 'utf8').catch(() => '');
+    list.push({ agent: f.replace(/\.md$/, ''), file: `traces/${f}`, bytes: Buffer.byteLength(text) });
+    if (!n || hits.length >= 200) continue;
+    const lines = text.split('\n');
+    lines.forEach((line, i) => {
+      if (hits.length < 200 && line.toLowerCase().includes(n)) {
+        hits.push({ agent: f.replace(/\.md$/, ''), file: `traces/${f}`, line: i + 1, snippet: stripAnsi(line).slice(0, 300) });
+      }
+    });
+  }
+  return { traces: list, hits, query: needle || '' };
+}
+
+/// The CLI prints progress before the `--json` payload; take the last line that
+/// parses as JSON so a banner or a warning never breaks the parse.
+function lastJsonLine(buf) {
+  const lines = stripAnsi(buf || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].startsWith('[') || lines[i].startsWith('{')) return lines[i];
+  }
+  return '[]';
+}
+
+/// A finding-id is used as a file name; keep it to the safe charset.
+function safeId(id) { return /^[a-zA-Z0-9_.:-]+$/.test(id) ? id : null; }
+
+async function readRetests(dir, findingId) {
+  const id = safeId(findingId);
+  if (!id) return [];
+  return await readJsonSafe(path.join(dir, 'retests', `${id}.json`), []);
+}
+
+/// Append one re-test outcome to the finding's dated history (newest last).
+async function appendRetest(dir, findingId, entry) {
+  const id = safeId(findingId);
+  if (!id) return [];
+  const rdir = path.join(dir, 'retests');
+  await fsp.mkdir(rdir, { recursive: true }).catch(() => {});
+  const file = path.join(rdir, `${id}.json`);
+  const history = await readJsonSafe(file, []);
+  history.push(entry);
+  await fsp.writeFile(file, JSON.stringify(history, null, 2)).catch(() => {});
+  return history;
+}
+
+/// The real HTTP exchanges that back one finding: first the ones the harness
+/// measured itself (the finding's own evidence_data — baseline/attack, the
+/// identity pair, matrix probes, the oracle), each with its wire provenance;
+/// then, when the recording interceptor ran, the recorded flows on the same
+/// endpoint. This is the finding's proof as bytes, not as the agent's prose.
+async function findingTraffic(dir, findingId) {
+  const findings = await readJsonSafe(path.join(dir, 'findings.json'), []);
+  const f = findings.find((x) => x.id === findingId);
+  if (!f) return { error: 'finding not found', exchanges: [], flows: [] };
+  const ev = f.evidence_data || {};
+  const exchanges = [];
+  const push = (role, ex) => { if (ex && (ex.url || ex.body)) exchanges.push({ role, ...ex }); };
+  push('baseline', ev.baseline);
+  push('attack', ev.attack);
+  (ev.repeats || []).forEach((ex, i) => push(`repeat ${i + 1}`, ex));
+  push('as owner', ev.identity_a);
+  push('as other identity', ev.identity_b);
+  (ev.matrix || []).forEach((p) => push(`matrix · ${p.identity || '?'} (expect ${p.expect || '?'})`, p.exchange));
+  if (ev.oracle) { push('oracle · should-be-denied', ev.oracle.denied); push('oracle · control', ev.oracle.control); }
+  // Recorded flows whose path matches the finding's endpoint, newest first.
+  let ep = '';
+  try { ep = new URL(f.endpoint).pathname; } catch { ep = String(f.endpoint || '').replace(/^https?:\/\/[^/]+/, '') || f.endpoint; }
+  const text = await fsp.readFile(path.join(dir, 'flows.jsonl'), 'utf8').catch(() => '');
+  const flows = text.split('\n').filter(Boolean)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter((r) => r && ep && String(r.url || '').includes(ep))
+    .reverse().slice(0, 50);
+  return { finding: { id: f.id, title: f.title, endpoint: f.endpoint }, wire: ev.wire || null, exchanges, flows };
+}
+
+/// A stable identity for a finding across runs of the same target: its CWE (or,
+/// lacking one, a slug of its title) plus the endpoint's path. Query strings and
+/// object ids vary run to run, so they are dropped — the point is "the same bug",
+/// not "the same request".
+function findingKey(f) {
+  const cwe = String(f.cwe || '').trim().toUpperCase();
+  const base = cwe || String(f.title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
+  let p = '';
+  try { p = new URL(f.endpoint).pathname; } catch { p = String(f.endpoint || '').replace(/^https?:\/\/[^/]+/, '').split('?')[0]; }
+  p = p.replace(/\/\d+(?=\/|$)/g, '/{id}').replace(/\/+$/, '') || '/';
+  return `${base}|${p}`;
+}
+
+const isReview = (f) => f.review_status === 'needs-review' || f.review_status === 'rejected';
+
+/// Compare one finished run to the most recent EARLIER run of the same target:
+/// which findings are new, which recur, and which were confirmed before and are
+/// now gone. Runs over whatever is already on disk — no model, no network.
+async function runRegression(dir, id) {
+  const norm = (t) => String(t || '').replace(/\/+$/, '').toLowerCase();
+  const [meta, status, findings] = await Promise.all([
+    readJsonSafe(path.join(dir, 'meta.json'), {}),
+    readJsonSafe(path.join(dir, 'status.json'), {}),
+    readJsonSafe(path.join(dir, 'findings.json'), []),
+  ]);
+  const target = norm(status.target || meta.target);
+  const ts = (id.match(/^ns-(\d+)-/) || [])[1] | 0;
+  if (!target) return { prev: null, status: {}, fixed: [] };
+  // The newest earlier run of the same target.
+  let ids = [];
+  try { ids = (await fsp.readdir(RUNS_DIR)).filter((d) => d.startsWith('ns-') && d !== id); } catch { /* none */ }
+  let prev = null;
+  for (const other of ids) {
+    const ots = (other.match(/^ns-(\d+)-/) || [])[1] | 0;
+    if (!ots || ots >= ts) continue;
+    const [om, os] = await Promise.all([
+      readJsonSafe(path.join(RUNS_DIR, other, 'meta.json'), {}),
+      readJsonSafe(path.join(RUNS_DIR, other, 'status.json'), {}),
+    ]);
+    if (norm(os.target || om.target) !== target) continue;
+    if (!prev || ots > prev.ts) prev = { id: other, ts: ots };
+  }
+  if (!prev) return { prev: null, status: {}, fixed: [] };
+  const prevFindings = await readJsonSafe(path.join(RUNS_DIR, prev.id, 'findings.json'), []);
+  const prevByKey = new Map();
+  for (const pf of prevFindings) {
+    const k = findingKey(pf);
+    if (!prevByKey.has(k)) prevByKey.set(k, pf);
+  }
+  const nowKeys = new Set(findings.map(findingKey));
+  // Per-finding verdict for the current run: recurring if the prior run had it.
+  const perFinding = {};
+  for (const f of findings) perFinding[f.id] = prevByKey.has(findingKey(f)) ? 'recurring' : 'new';
+  // Fixed: confirmed in the prior run, absent now.
+  const fixed = prevFindings
+    .filter((pf) => !isReview(pf) && !nowKeys.has(findingKey(pf)))
+    .map((pf) => ({ title: pf.title, severity: pf.severity, cwe: pf.cwe, endpoint: pf.endpoint }));
+  return { prev: { id: prev.id, ts: prev.ts, when: new Date(prev.ts * 1000).toISOString() }, status: perFinding, fixed };
 }
 
 function safeRunDir(id) {
@@ -623,6 +981,7 @@ class Job extends EventEmitter {
       startedAt: this.startedAt,
       interrupted: !!this.interrupted,
       resumable: !!this.resumable,
+      agentStatus: this.agentStatus || {},
     };
   }
 }
@@ -635,18 +994,26 @@ function ingestLine(job, rawLine) {
   const low = line.toLowerCase();
   job.push({ type: 'log', line });
 
+  // The REPL/CLI decorates every streamed line with a leading glyph + spaces
+  // ("  · ", "  ✗ ", "  🧪 testing ", …). Machine markers (finding_json:,
+  // "exploit <name> via … → N candidate(s)") therefore don't start at column 0,
+  // so strip the decoration before matching — otherwise live findings and the
+  // per-agent progress never reach the UI even though the run is producing them.
+  const norm = line.replace(/^\s*[^\w/{(]*\s*/u, '').replace(/^testing\s+/i, '');
+  const lown = norm.toLowerCase();
+
   if (low.includes('paused by operator')) job.phase = 'paused (operator)';
   else if (low.includes('resumed by operator') || low.includes('▶ resumed')) job.phase = 'running';
   else if (low.includes('token/quota exhausted') || low.includes('run is paused')) job.phase = 'paused (quota)';
   else if (low.includes('authentication failed') || low.includes('circuit breaker')) job.phase = 'paused (auth)';
-  else if (low.startsWith('recon') || low.startsWith('ai-recon') || low.includes('recon round') || low.startsWith('probe:')) job.phase = 'recon';
+  else if (lown.startsWith('recon') || lown.startsWith('ai-recon') || low.includes('recon round') || lown.startsWith('probe:')) job.phase = 'recon';
   else if (low.includes('selected') && low.includes('agent')) {
     job.phase = 'planning';
     const n = line.split(/\s+/).map(Number).find((x) => Number.isFinite(x));
     if (n) job.agents = n;
-  } else if (low.startsWith('exploit') || low.startsWith('test ') || low.includes('launching agent')) job.phase = 'exploiting';
-  else if (low.startsWith('vote') || low.includes('validating')) job.phase = 'validating';
-  else if (low.startsWith('chain')) job.phase = 'chaining';
+  } else if (lown.startsWith('exploit') || lown.startsWith('test ') || low.includes('launching agent')) job.phase = 'exploiting';
+  else if (lown.startsWith('vote') || low.includes('validating')) job.phase = 'validating';
+  else if (lown.startsWith('chain')) job.phase = 'chaining';
   else if (low.includes('phase complete') || low.includes('validated finding(s)')) {
     job.phase = 'complete';
     // A REPL-backed job's child process doesn't exit when the engagement
@@ -655,9 +1022,9 @@ function ingestLine(job, rawLine) {
     if (job.repl && !job.done) { job.done = true; job.push({ type: 'done', exitCode: 0 }); }
   }
 
-  if (/candidate\(s\)/.test(low) && /^(exploit |test |analyze |review )/.test(low)) job.agentsDone += 1;
+  if (/candidate\(s\)/.test(lown) && /^(exploit|test|analyze|review)\b/.test(lown)) job.agentsDone += 1;
 
-  const fj = line.match(/^finding_json:\s*(.+)$/);
+  const fj = norm.match(/^finding_json:\s*(.+)$/);
   if (fj) {
     try {
       const finding = JSON.parse(fj[1]);
@@ -671,12 +1038,47 @@ function ingestLine(job, rawLine) {
 
   const rid = line.match(/run id\s*:\s*(\S+)/);
   if (rid) { job.runId = rid[1]; saveEngagementName(job.runId, job.name); }
+
+  // --- live per-agent status, for the "what's being tested" panel ---
+  if (!job.agentStatus) job.agentStatus = {};
+  // Roster: "selected N ... agent(s): a, b, c"
+  const roster = line.match(/selected\s+\d+[^:]*agent\(s\):\s*(.+)$/i);
+  if (roster) {
+    for (const nm of roster[1].split(/[,\s]+/).map((s) => s.trim()).filter(Boolean)) {
+      if (!job.agentStatus[nm]) job.agentStatus[nm] = { status: 'pending', found: 0 };
+    }
+  }
+  // Start: "▶ launching agent: <name> (<title>)"
+  const launch = line.match(/launching agent:\s*([^\s(]+)/);
+  if (launch) {
+    const nm = launch[1];
+    job.agentStatus[nm] = { ...(job.agentStatus[nm] || {}), status: 'running', found: job.agentStatus[nm]?.found || 0, title: (line.match(/\(([^)]+)\)\s*$/) || [])[1] || '' };
+    job.push({ type: 'agent', name: nm, status: 'running' });
+  }
+  // Done: "exploit|analyze|test <name> via <model> → N candidate(s)"
+  const done = norm.match(/^(?:exploit|analyze|test|review)\s+(\S+)\s+via\s+.+?(?:→|->)\s*(\d+)\s+candidate/i);
+  if (done) {
+    const nm = done[1]; const n = Number(done[2]) || 0;
+    job.agentStatus[nm] = { ...(job.agentStatus[nm] || {}), status: 'done', found: n };
+    job.push({ type: 'agent', name: nm, status: 'done', found: n });
+  }
+  // Failed: "<verb> <name> failed: ..."
+  const failed = norm.match(/^(?:exploit|analyze|test|chain|review)\s+(\S+)\s+failed/i);
+  if (failed) {
+    const nm = failed[1];
+    job.agentStatus[nm] = { ...(job.agentStatus[nm] || {}), status: 'failed' };
+    job.push({ type: 'agent', name: nm, status: 'failed' });
+  }
 }
 
 function buildArgs(body) {
-  const mode = body.mode || 'run';
+  const rawMode = body.mode || 'run';
+  const mode = rawMode === 'cloud' ? 'host' : rawMode;
   const args = [mode];
-  if (mode === 'run' || mode === 'host' || mode === 'aitest') {
+  if (rawMode === 'cloud') {
+    args.push(body.target || 'localhost');
+    args.push('--cloud', body.target || 'aws');
+  } else if (mode === 'run' || mode === 'host' || mode === 'aitest') {
     args.push(body.target);
   } else if (mode === 'whitebox' || mode === 'skills') {
     args.push(body.repo || body.target);
@@ -693,6 +1095,7 @@ function buildArgs(body) {
   if (body.subscription) args.push('--subscription');
   if (body.mcp) args.push('--mcp');
   if (body.creds) args.push('--creds', body.creds);
+  if (body.collectionPath) args.push('--collection', body.collectionPath);
   if (body.focus) args.push('--focus', body.focus);
   if (body.objective) args.push('--objective', body.objective);
   if (body.outOfScope) args.push('--out-of-scope', body.outOfScope);
@@ -731,12 +1134,14 @@ async function startJob(body) {
   const id = crypto.randomUUID();
   const credsPath = await materializeCreds(body, id);
   const scopePath = await materializeScope(body, id);
-  const args = buildArgs({ ...body, creds: credsPath, scopePath });
+  const collectionPath = await materializeCollection(body, id);
+  const args = buildArgs({ ...body, creds: credsPath, scopePath, collectionPath });
   const job = new Job(id, BIN, args, body.repo || body.target || '', body.name || '');
   job.pinnedAgents = body.agents || [];
   jobs.set(id, job);
 
-  const child = spawn(BIN, args, { cwd: ROOT, env: { ...process.env, ...envOverrides() } });
+  const cloudEnv = body.cloudProvider ? await cloudEnvOverrides(body.cloudProvider) : {};
+  const child = spawn(BIN, args, { cwd: ROOT, env: { ...process.env, ...envOverrides(), ...cloudEnv } });
   job.child = child;
   let buf = '';
   const onData = (chunk) => {
@@ -772,13 +1177,18 @@ async function startJob(body) {
 /// Flags that apply to every mode, including the REPL-backed one. The REPL
 /// takes them as argv because a `/`-command for an authorization ceiling would
 /// let the session widen its own grant mid-run.
+// The REPL is spawned as `neurosploit` with NO subcommand, so ONLY global
+// flags are valid here — passing a `run`-subcommand flag (e.g. --environment,
+// --budget, --compliance) at this position makes clap abort before the REPL
+// even starts, which silently kills the engagement. The run-only knobs are
+// delivered through the REPL script (buildReplScript) instead, or applied at
+// their defaults. Keep this list to the `global = true` args in app/src/main.rs.
 function authArgs(body) {
   const args = [];
-  for (const entry of body.inScope || []) args.push('--in-scope', entry);
-  if (body.scopePath) args.push('--scope-file', body.scopePath);
   if (body.capability) args.push('--capability-token', body.capability);
-  if (body.environment) args.push('--environment', body.environment);
-  if (body.policyProfile) args.push('--policy', body.policyProfile);
+  for (const entry of body.inScope || []) args.push('--session-in-scope', entry);
+  if (body.environment) args.push('--session-environment', body.environment);
+  if (body.policyProfile) args.push('--session-policy', body.policyProfile);
   // Egress and the OOB channel are launcher-level, like the grant: a session
   // must not be able to re-route its own traffic once it is running.
   if (body.transport && body.transport !== 'direct') args.push('--transport', body.transport);
@@ -787,16 +1197,9 @@ function authArgs(body) {
   if (body.oobDns) args.push('--oob-dns', body.oobDns);
   if (body.sms) args.push('--sms', body.sms);
   if (body.typesafe) args.push('--typesafe', body.typesafe);
+  if (body.decisionBackend) args.push('--decision-backend', body.decisionBackend);
   if (body.intercept && body.intercept !== 'off') args.push('--intercept', body.intercept);
   if (body.sandbox) args.push('--sandbox', body.sandbox === 'default' ? '' : body.sandbox);
-  if (body.revalidatePoc) args.push('--revalidate-poc');
-  for (const fw of body.compliance || []) args.push('--compliance', fw);
-  if (body.budget && body.budget !== 'unlimited') args.push('--budget', body.budget);
-  if (body.tokenLimit) args.push('--token-limit', String(body.tokenLimit));
-  if (body.deepTestLimit) args.push('--deep-test-limit', String(body.deepTestLimit));
-  if (body.order === 'depth-first') args.push('--depth-first');
-  else if (body.order === 'coverage-first') args.push('--coverage-first');
-  if (body.samplePerRoute) args.push('--sample-per-route', String(body.samplePerRoute));
   return args;
 }
 
@@ -822,6 +1225,7 @@ function sanitizeLaunch(body) {
     sandbox: !!body.sandbox,
     typesafe: body.typesafe,
     quick: !!body.quick,
+    research: !!body.research,
   };
 }
 
@@ -842,6 +1246,18 @@ function buildReplScript(body) {
   if (body.objective) lines.push(`/objective ${body.objective}`);
   if (body.outOfScope) lines.push(`/scope-out ${body.outOfScope}`);
   if (body.creds) lines.push(`/creds ${body.creds}`);
+  if (body.collectionPath) lines.push(`/collection ${body.collectionPath}`);
+  if (body.research) lines.push(`/research on`);
+  // Settings the wizard collects that are NOT already applied as launch flags
+  // (authArgs) or the scope file. Emitted via the REPL's own commands so a web
+  // run enforces exactly what a typed session would. Capability, in-scope,
+  // intercept, sandbox, OOB, environment, policy and the scope allowlist are
+  // handled at launch in authArgs()/materializeScope() — do not re-emit them here.
+  if (body.classes) lines.push(`/class ${Array.isArray(body.classes) ? body.classes.join(',') : body.classes}`);
+  if (body.revalidatePoc) lines.push('/revalidate on');
+  if (body.budget && body.budget !== 'unlimited') lines.push(`/budget ${body.budget}`);
+  if (body.tokenLimit) lines.push(`/budget token ${body.tokenLimit}`);
+  for (const fw of body.compliance || []) lines.push(`/compliance ${fw}`);
   lines.push((body.agents || []).length ? `/only ${body.agents.join(',')}` : '/only clear');
   // Economy preset last, so it wins over the per-knob settings above.
   if (body.quick) lines.push('/quick');
@@ -861,7 +1277,8 @@ async function startJobViaRepl(body) {
   if (!BIN) throw new Error('neurosploit binary not found — run `cargo build --release` in neurosploit-rs/');
   const id = crypto.randomUUID();
   const credsPath = await materializeCreds(body, id);
-  const script = buildReplScript({ ...body, creds: credsPath });
+  const collectionPath = await materializeCollection(body, id);
+  const script = buildReplScript({ ...body, creds: credsPath, collectionPath });
   const scopePath = await materializeScope(body, id);
   const auth = authArgs({ ...body, scopePath });
   const job = new Job(id, BIN, auth, body.repo || body.target || '', body.name || '');
@@ -1128,7 +1545,8 @@ async function serveRunAsset(req, res, id, rest) {
   const dir = safeRunDir(id);
   if (!dir) { res.writeHead(400); res.end(); return; }
   const full = path.join(dir, rest);
-  if (!full.startsWith(dir)) { res.writeHead(403); res.end(); return; }
+  // Separator-aware: `ns-1` must not reach into `ns-10`.
+  if (full !== dir && !full.startsWith(dir + path.sep)) { res.writeHead(403); res.end(); return; }
   try {
     const data = await fsp.readFile(full);
     const ext = path.extname(full);
@@ -1182,6 +1600,40 @@ const server = http.createServer(async (req, res) => {
       const { agents } = await loadAgents();
       const created = agents.find((a) => a.id === slug);
       return sendJson(res, 200, { agent: created, raw: clean });
+    }
+
+    // ---- custom lead from the operator's OWN agent markdown (verbatim) ----
+    if (req.method === 'POST' && p === '/api/leads/custom') {
+      const body = await readBody(req);
+      const title = (body.title || '').trim();
+      let md = (body.markdown || '').trim();
+      if (!md) return sendJson(res, 400, { error: 'paste the agent markdown (or a system prompt)' });
+      // Accept a bare system prompt too: wrap it into the minimal agent shape so
+      // it is a real, pinnable agent like every other lead.
+      if (!/^#\s+/m.test(md) || !/##\s*User Prompt/i.test(md) || !/##\s*System Prompt/i.test(md)) {
+        const name = title || 'Custom Lead';
+        md = `# ${name} Agent\n## User Prompt\nYou are testing **{target}**.\n**Recon Context:**\n{recon_json}\n\n${md}\n\n### Report\n\`\`\`\nFINDING:\n- Title: ...\n- Severity: ...\n- CWE: CWE-...\n- Endpoint: [URL]\n- Evidence: ...\n- Impact: ...\n- Remediation: ...\n\`\`\`\n## System Prompt\n${md}\n`;
+      }
+      const titleMatch = md.match(/^#\s+(.+?)\s*$/m);
+      const slug = `custom_${slugify(title || (titleMatch && titleMatch[1]) || 'lead')}`;
+      await fsp.writeFile(path.join(AGENTS_DIR, 'vulns', `${slug}.md`), md.trim() + '\n');
+      agentCache = null;
+      const { agents } = await loadAgents();
+      return sendJson(res, 200, { agent: agents.find((a) => a.id === slug), raw: md });
+    }
+
+    // ---- delete a custom lead (only the operator's own custom_* agents) ----
+    const delLead = p.match(/^\/api\/leads\/([^/]+)$/);
+    if (req.method === 'DELETE' && delLead) {
+      const id = decodeURIComponent(delLead[1]);
+      if (!/^custom_[a-z0-9_]+$/.test(id)) return sendJson(res, 400, { error: 'only custom leads can be removed' });
+      const file = path.join(AGENTS_DIR, 'vulns', `${id}.md`);
+      if (!file.startsWith(path.join(AGENTS_DIR, 'vulns') + path.sep) || !fs.existsSync(file)) {
+        return sendJson(res, 404, { error: 'custom lead not found' });
+      }
+      await fsp.rm(file, { force: true });
+      agentCache = null;
+      return sendJson(res, 200, { ok: true, removed: id });
     }
 
     // ---- runs ----
@@ -1255,13 +1707,31 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && m) {
       const job = jobs.get(m[1]);
       if (!job) return sendJson(res, 404, { error: 'job not found' });
-      if (job.repl && job.child?.stdin?.writable) {
-        // The REPL's own graceful stop: /stop then choose "1" — validate
-        // what's found so far, then report. Plain SIGINT doesn't map to
-        // anything here (no signal handler in the REPL's own input loop).
-        job.child.stdin.write('/stop\n1\n');
+      const child = job.child;
+      const alive = !!child && child.exitCode === null && !child.killed;
+      if (!alive) {
+        // Nothing left to stop (the run already exited — e.g. it failed to
+        // launch). Mark it done so the UI stops showing it as running.
+        if (!job.done) { job.done = true; job.phase = 'stopped'; job.push({ type: 'done', exitCode: job.exitCode ?? 0 }); }
+        return sendJson(res, 200, { ok: true, note: 'already stopped' });
+      }
+      if (job.repl && child.stdin && child.stdin.writable) {
+        // Graceful: /stop then "1" — validate what's found so far, then report.
+        // A second press (or the fallback below) escalates to a signal.
+        if (job._stopping) { child.kill('SIGTERM'); }
+        else {
+          job._stopping = true;
+          job.phase = 'stopping';
+          job.push({ type: 'log', line: '[web] stopping — validating findings so far, then reporting…' });
+          try { child.stdin.write('/stop\n1\n'); } catch { child.kill('SIGTERM'); }
+          // If the REPL hasn't exited in time, don't leave it hanging.
+          setTimeout(() => { if (child.exitCode === null && !child.killed) child.kill('SIGTERM'); }, 45000).unref?.();
+          setTimeout(() => { if (child.exitCode === null && !child.killed) child.kill('SIGKILL'); }, 60000).unref?.();
+        }
       } else {
-        job.child?.kill('SIGINT');
+        child.kill('SIGINT');
+        setTimeout(() => { if (child.exitCode === null && !child.killed) child.kill('SIGTERM'); }, 5000).unref?.();
+        setTimeout(() => { if (child.exitCode === null && !child.killed) child.kill('SIGKILL'); }, 10000).unref?.();
       }
       return sendJson(res, 200, { ok: true });
     }
@@ -1369,6 +1839,79 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ---- attack graph / traffic / traces (files the CLI wrote) ----
+    m = p.match(/^\/api\/runs\/([^/]+)\/graph$/);
+    if (m) {
+      const dir = safeRunDir(decodeURIComponent(m[1]));
+      if (!dir || !fs.existsSync(dir)) return sendJson(res, 404, { error: 'run not found' });
+      if (req.method === 'GET') return sendJson(res, 200, await runGraph(dir));
+      if (req.method === 'POST') {
+        // Recompute (and optionally push to Neo4j) through the CLI itself.
+        const body = await readBody(req);
+        const args = ['graph', dir, '--top', '0'];
+        if (body.push) args.push('--push');
+        const out = await runCli(args);
+        if (out.code !== 0) return sendJson(res, 502, { error: out.buf.trim() || 'graph failed' });
+        return sendJson(res, 200, { ok: true, output: out.buf.trim(), ...(await runGraph(dir)) });
+      }
+    }
+    m = p.match(/^\/api\/runs\/([^/]+)\/traffic$/);
+    if (req.method === 'GET' && m) {
+      const dir = safeRunDir(decodeURIComponent(m[1]));
+      if (!dir || !fs.existsSync(dir)) return sendJson(res, 404, { error: 'run not found' });
+      return sendJson(res, 200, await runTraffic(dir, u.searchParams));
+    }
+    m = p.match(/^\/api\/runs\/([^/]+)\/traces$/);
+    if (req.method === 'GET' && m) {
+      const dir = safeRunDir(decodeURIComponent(m[1]));
+      if (!dir || !fs.existsSync(dir)) return sendJson(res, 404, { error: 'run not found' });
+      return sendJson(res, 200, await searchTraces(dir, u.searchParams.get('q')));
+    }
+    // ---- PoC re-test (the CLI re-runs each finding's recorded proof) ----
+    m = p.match(/^\/api\/runs\/([^/]+)\/retest$/);
+    if (req.method === 'POST' && m) {
+      const dir = safeRunDir(decodeURIComponent(m[1]));
+      if (!dir || !fs.existsSync(dir)) return sendJson(res, 404, { error: 'run not found' });
+      const body = await readBody(req).catch(() => ({}));
+      const only = typeof body.finding === 'string' && body.finding ? body.finding : null;
+      // Per-finding re-test asks the CLI for JSON and keeps a dated history so
+      // the operator can see a finding drift from reproduced to gone over time.
+      if (only) {
+        const out = await runCli(['poc', dir, '--only', only, '--json']);
+        if (out.code !== 0) return sendJson(res, 502, { error: out.buf.trim() || 're-test failed' });
+        let result = null;
+        try { result = (JSON.parse(lastJsonLine(out.buf)) || [])[0] || null; } catch { /* keep raw */ }
+        const entry = { at: Math.floor(Date.now() / 1000), ...(result || {}), raw: result ? undefined : out.buf.trim() };
+        const history = await appendRetest(dir, only, entry);
+        return sendJson(res, 200, { ok: true, result: entry, history });
+      }
+      const out = await runCli(['poc', dir]);
+      if (out.code !== 0) return sendJson(res, 502, { error: out.buf.trim() || 're-test failed' });
+      return sendJson(res, 200, { ok: true, output: out.buf.trim() });
+    }
+    // ---- per-finding re-test history ----
+    m = p.match(/^\/api\/runs\/([^/]+)\/retests\/([^/]+)$/);
+    if (req.method === 'GET' && m) {
+      const dir = safeRunDir(decodeURIComponent(m[1]));
+      if (!dir || !fs.existsSync(dir)) return sendJson(res, 404, { error: 'run not found' });
+      return sendJson(res, 200, { history: await readRetests(dir, decodeURIComponent(m[2])) });
+    }
+    // ---- regression vs the previous run of the same target ----
+    m = p.match(/^\/api\/runs\/([^/]+)\/regression$/);
+    if (req.method === 'GET' && m) {
+      const id = decodeURIComponent(m[1]);
+      const dir = safeRunDir(id);
+      if (!dir || !fs.existsSync(dir)) return sendJson(res, 404, { error: 'run not found' });
+      return sendJson(res, 200, await runRegression(dir, id));
+    }
+    // ---- recorded traffic that backs one finding ----
+    m = p.match(/^\/api\/runs\/([^/]+)\/findings\/([^/]+)\/traffic$/);
+    if (req.method === 'GET' && m) {
+      const dir = safeRunDir(decodeURIComponent(m[1]));
+      if (!dir || !fs.existsSync(dir)) return sendJson(res, 404, { error: 'run not found' });
+      return sendJson(res, 200, await findingTraffic(dir, decodeURIComponent(m[2])));
+    }
+
     // ---- report rebuild (generate/refresh the PDF for a finished run) ----
     m = p.match(/^\/api\/runs\/([^/]+)\/report$/);
     if (req.method === 'POST' && m) {
@@ -1407,7 +1950,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && p === '/api/meta') {
-      return sendJson(res, 200, { version: '4.2.1', binary: BIN, root: ROOT });
+      return sendJson(res, 200, { version: VERSION, binary: BIN, root: ROOT });
     }
 
     // ---- providers / API keys (in-memory only, never persisted) ----
@@ -1424,12 +1967,135 @@ const server = http.createServer(async (req, res) => {
       }
       if (body.key) apiKeys.set(body.provider, body.key);
       else apiKeys.delete(body.provider);
-      return sendJson(res, 200, { ok: true });
+      // Save also verifies the key with a cheap authenticated call, so the
+      // operator knows it works before a run depends on it. The key is saved
+      // either way (some providers can't be auto-verified from here).
+      let verify = { ok: null, message: 'saved' };
+      if (body.key && body.verify !== false) verify = await verifyKey(body.provider, body.key);
+      return sendJson(res, 200, { ok: true, verify });
+    }
+    if (req.method === 'POST' && p === '/api/keys/verify') {
+      const body = await readBody(req);
+      const key = body.key || apiKeys.get(body.provider);
+      if (!body.provider || !PROVIDERS.some((pr) => pr.key === body.provider)) return sendJson(res, 400, { error: 'unknown provider' });
+      if (!key) return sendJson(res, 400, { error: 'no key to verify' });
+      return sendJson(res, 200, await verifyKey(body.provider, key));
     }
     m = p.match(/^\/api\/keys\/([^/]+)$/);
     if (req.method === 'DELETE' && m) {
       apiKeys.delete(decodeURIComponent(m[1]));
       return sendJson(res, 200, { ok: true });
+    }
+
+    // ---- Issues (aggregate findings across all runs) ----
+    if (req.method === 'GET' && p === '/api/issues') {
+      const dirs = await fsp.readdir(RUNS_DIR).catch(() => []);
+      const all = [];
+      for (const d of dirs) {
+        const fp = path.join(RUNS_DIR, d, 'findings.json');
+        try {
+          const raw = await fsp.readFile(fp, 'utf8');
+          const findings = JSON.parse(raw);
+          let runTarget = d;
+          try { const meta = JSON.parse(await fsp.readFile(path.join(RUNS_DIR, d, 'meta.json'), 'utf8')); runTarget = meta.target || d; } catch {}
+          for (const f of findings) all.push({ ...f, run: d, target: f.target || runTarget });
+        } catch { /* skip */ }
+      }
+      const sRank = (s) => { s = (s || '').toLowerCase(); return s.includes('crit') ? 0 : s.includes('high') ? 1 : s.includes('med') ? 2 : s.includes('low') ? 3 : 4; };
+      all.sort((a, b) => sRank(a.severity) - sRank(b.severity));
+      return sendJson(res, 200, all);
+    }
+
+    // ---- Config CRUD: repos ----
+    if (req.method === 'GET' && p === '/api/config/repos') return sendJson(res, 200, await readConfig('repos'));
+    if (req.method === 'POST' && p === '/api/config/repos') {
+      const body = await readBody(req);
+      const repos = await readConfig('repos');
+      const item = { id: crypto.randomUUID(), ...body, createdAt: new Date().toISOString() };
+      repos.push(item);
+      await writeConfig('repos', repos);
+      return sendJson(res, 200, item);
+    }
+    m = p.match(/^\/api\/config\/repos\/([^/]+)$/);
+    if (req.method === 'DELETE' && m) {
+      let repos = await readConfig('repos');
+      repos = repos.filter(r => r.id !== decodeURIComponent(m[1]));
+      await writeConfig('repos', repos);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // ---- Config CRUD: domains ----
+    if (req.method === 'GET' && p === '/api/config/domains') return sendJson(res, 200, await readConfig('domains'));
+    if (req.method === 'POST' && p === '/api/config/domains') {
+      const body = await readBody(req);
+      const domains = await readConfig('domains');
+      const item = { id: crypto.randomUUID(), ...body, createdAt: new Date().toISOString() };
+      domains.push(item);
+      await writeConfig('domains', domains);
+      return sendJson(res, 200, item);
+    }
+    m = p.match(/^\/api\/config\/domains\/([^/]+)$/);
+    if (req.method === 'DELETE' && m) {
+      let domains = await readConfig('domains');
+      domains = domains.filter(d => d.id !== decodeURIComponent(m[1]));
+      await writeConfig('domains', domains);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // ---- Config CRUD: networks ----
+    if (req.method === 'GET' && p === '/api/config/networks') return sendJson(res, 200, await readConfig('networks'));
+    if (req.method === 'POST' && p === '/api/config/networks') {
+      const body = await readBody(req);
+      const networks = await readConfig('networks');
+      const item = { id: crypto.randomUUID(), ...body, createdAt: new Date().toISOString() };
+      networks.push(item);
+      await writeConfig('networks', networks);
+      return sendJson(res, 200, item);
+    }
+    m = p.match(/^\/api\/config\/networks\/([^/]+)$/);
+    if (req.method === 'DELETE' && m) {
+      let networks = await readConfig('networks');
+      networks = networks.filter(n => n.id !== decodeURIComponent(m[1]));
+      await writeConfig('networks', networks);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // ---- Config CRUD: integrations ----
+    if (req.method === 'GET' && p === '/api/config/integrations') return sendJson(res, 200, await readConfig('integrations'));
+    m = p.match(/^\/api\/config\/integrations\/([^/]+)$/);
+    if (req.method === 'PUT' && m) {
+      const body = await readBody(req);
+      let integs = await readConfig('integrations');
+      const id = decodeURIComponent(m[1]);
+      const idx = integs.findIndex(i => i.id === id);
+      if (idx >= 0) integs[idx] = { ...integs[idx], ...body };
+      else integs.push({ id, ...body });
+      await writeConfig('integrations', integs);
+      return sendJson(res, 200, integs.find(i => i.id === id));
+    }
+
+    // ---- Config: settings ----
+    if (req.method === 'GET' && p === '/api/config/settings') return sendJson(res, 200, await readConfigObj('settings'));
+    if (req.method === 'PUT' && p === '/api/config/settings') {
+      const body = await readBody(req);
+      await writeConfig('settings', body);
+      return sendJson(res, 200, body);
+    }
+
+    // ---- Config: vault ----
+    if (req.method === 'GET' && p === '/api/config/vault') return sendJson(res, 200, await readConfigObj('vault'));
+    if (req.method === 'PUT' && p === '/api/config/vault') {
+      const body = await readBody(req);
+      await writeConfig('vault', body);
+      return sendJson(res, 200, body);
+    }
+
+    // ---- Config: guardrails ----
+    if (req.method === 'GET' && p === '/api/config/guardrails') return sendJson(res, 200, await readConfigObj('guardrails'));
+    if (req.method === 'PUT' && p === '/api/config/guardrails') {
+      const body = await readBody(req);
+      await writeConfig('guardrails', body);
+      return sendJson(res, 200, body);
     }
 
     sendJson(res, 404, { error: 'not found' });
@@ -1441,7 +2107,7 @@ const server = http.createServer(async (req, res) => {
 loadPersistedJobs();
 
 server.listen(PORT, () => {
-  console.log(`NeuroSploit v4.2.1 web console → http://localhost:${PORT}`);
+  console.log(`NeuroSploit v${VERSION} web console → http://localhost:${PORT}`);
   console.log(`  binary : ${BIN || '(not found — build neurosploit-rs first)'}`);
   console.log(`  agents : ${AGENTS_DIR}`);
   console.log(`  runs   : ${RUNS_DIR}`);

@@ -242,8 +242,9 @@ pub fn html_with_pocs(target: &str, findings: &[Finding], meta: &EngagementMeta,
          <h2>Executive Summary</h2><div class=summary-grid>{summary_grid}</div>\
          {vuln_summary}\
          <h2>Findings ({n})</h2>{body}\
-         <p class=footer>Authorized testing only. Confirmed findings passed multi-model voting, receipt grounding and adversarial refute; \"needs-review\" are flagged for a human.<br>NeuroSploit v4.2.0 · by <b>Joas A Santos</b> &amp; <b>Red Team Leaders</b><br><span style=\"font-family:ui-monospace,monospace\">{provenance}</span></p></body></html>",
+         <p class=footer>Authorized testing only. Confirmed findings passed multi-model voting, receipt grounding and adversarial refute; \"needs-review\" are flagged for a human.<br>NeuroSploit v{VER} · by <b>Joas A Santos</b> &amp; <b>Red Team Leaders</b><br><span style=\"font-family:ui-monospace,monospace\">{provenance}</span></p></body></html>",
         t = esc(target), n = sorted.len(), body = body, summary_grid = summary_grid, vuln_summary = vuln_summary,
+        VER = env!("CARGO_PKG_VERSION"),
         // Which build produced this document. A report that circulates without
         // it is a report nobody can trace back to the run that made it.
         provenance = esc(&crate::provenance::Provenance::process().tag()),
@@ -500,11 +501,23 @@ fn tq(s: &str) -> String {
     format!("\"{}\"", cleaned)
 }
 
+/// Like `tq` but preserves newlines as literal `\n` inside the Typst string,
+/// so multi-paragraph text renders with proper line breaks.
+fn tq_multi(s: &str) -> String {
+    let cleaned: String = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "");
+    format!("\"{}\"", cleaned)
+}
+
 /// Generate a self-contained `report.typ` (data + bundled template) in `dir`
 /// and compile it to `report.pdf` via the `typst` binary. Falls back to leaving
 /// the `.typ` when `typst` is unavailable.
 pub fn typst_report(target: &str, findings: &[Finding], dir: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
+    let shown = crate::redact::for_people(findings);
+    let findings = &shown[..];
     let run_id = dir.file_name().and_then(|s| s.to_str()).unwrap_or("run").to_string();
     let meta = read_meta(dir);
 
@@ -513,16 +526,27 @@ pub fn typst_report(target: &str, findings: &[Finding], dir: &Path) -> std::io::
     let confirmed: Vec<&Finding> = sorted.iter().filter(|f| !needs_review(f)).collect();
     let review: Vec<&Finding> = sorted.iter().filter(|f| needs_review(f)).collect();
     let asset = if meta.asset.is_empty() { "unidentified web asset".to_string() } else { meta.asset.clone() };
-    let accounts = findings.iter().find(|f| f.id == "test-accounts").map(|f| f.evidence.clone()).unwrap_or_default();
+    let accounts_raw = findings.iter().find(|f| f.id == "test-accounts").map(|f| f.evidence.clone()).unwrap_or_default();
+    let account_lines: Vec<&str> = accounts_raw.split('\n')
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let accounts_header = account_lines.first().copied().unwrap_or("");
+    let account_items: Vec<&str> = account_lines.iter().skip(1)
+        .filter(|l| l.starts_with("•") || l.starts_with("-") || l.starts_with("*"))
+        .map(|l| l.trim_start_matches(['•', '-', '*', ' ']))
+        .collect();
 
     let mut data = String::new();
+    let accounts_arr = format!("({})", account_items.iter().map(|a| format!("{},", tq(a))).collect::<String>());
     data.push_str(&format!(
-        "#let meta = (target: {}, asset: {}, tech: {}, server: {}, run_id: {}, generated: {}, model: {}, exec: {}, conclusion: {}, accounts: {}, provenance: {})\n",
+        "#let meta = (target: {}, asset: {}, tech: {}, server: {}, run_id: {}, generated: {}, model: {}, exec: {}, conclusion: {}, accounts_header: {}, accounts: {}, provenance: {})\n",
         tq(target), tq(&asset), tq(&meta.tech.join(", ")), tq(&meta.server),
         tq(&run_id), tq("July 2026"), tq("multi-model"),
         tq(&strip_md(&exec_summary(target, &meta, &confirmed, &review))),
         tq(&strip_md(&conclusion(target, &meta, &confirmed, &review))),
-        tq(&strip_md(&accounts)),
+        tq(&strip_md(accounts_header)),
+        accounts_arr,
         tq(&crate::provenance::Provenance::process().tag()),
     ));
     data.push_str("#let findings = (\n");
@@ -540,8 +564,8 @@ pub fn typst_report(target: &str, findings: &[Finding], dir: &Path) -> std::io::
         data.push_str(&format!(
             "  (severity: {}, title: {}, agent: {}, cwe: {}, owasp: {}, cvss: {}, endpoint: {}, payload: {}, evidence: {}, impact: {}, remediation: {}, votes: {}, confidence: {}, status: {}, auth: {}, screenshots: {}, location: {}, steps: {}),\n",
             tq(&f.severity), tq(&f.title), tq(&f.agent), tq(&f.cwe), tq(&owasp), tq(&f.cvss),
-            tq(&f.endpoint), tq(&wrappable(&f.payload)), tq(&wrappable(&technical_evidence(f))), tq(&f.impact),
-            tq(&f.remediation), tq(&f.votes), f.confidence, tq(status),
+            tq(&f.endpoint), tq(&wrappable(&f.payload)), tq(&wrappable(&technical_evidence(f))), tq_multi(&f.impact),
+            tq_multi(&f.remediation), tq(&f.votes), f.confidence, tq(status),
             tq(if f.auth_context.is_empty() { "-" } else { &f.auth_context }),
             shots,
             tq(&location_line(f)),
@@ -806,15 +830,35 @@ pub fn write_all(target: &str, findings: &[Finding], dir: &Path) -> std::io::Res
     std::fs::create_dir_all(dir)?;
     let run_id = dir.file_name().and_then(|s| s.to_str()).unwrap_or("run").to_string();
     let meta = read_meta(dir);
+    // Reports are for people: credentials the agents quoted become `$SECRET_n`.
+    // findings.json and the vault keep the raw values for re-testing.
+    let redactor = crate::redact::Redactor::learn(findings);
+    let raw = findings;
+    let shown = redactor.findings(findings);
+    let findings = &shown[..];
     let mut md = markdown(target, findings, &meta);
     md.push_str(&pocs_section(dir));
-    std::fs::write(dir.join("report.md"), md)?;
+    std::fs::write(dir.join("report.md"), redactor.text(&md))?;
     std::fs::write(dir.join("report.json"), json_report(target, findings, &run_id, &meta))?;
     std::fs::write(dir.join("report.sarif"), crate::sarif::to_string(target, findings))?;
+    // Additive deliverables (differential proof, custody chain, exploit-as-test,
+    // detection content, personas). Best-effort: a failure here never affects
+    // the reports above.
+    // They get the raw findings: the regression tests need the real payloads,
+    // and each applies its own data-minimisation rules.
+    if let Err(e) = crate::deliverables::write_all(target, raw, dir) {
+        eprintln!("deliverables: skipped ({e})");
+    }
+    // Attack graph (web + internal): chains, Cypher export, JSON. Works without
+    // Neo4j; best-effort like the deliverables. Raw so equal secrets correlate
+    // (only salted fingerprints are written).
+    if let Err(e) = crate::graph_memory::write_artifacts(target, &run_id, raw, dir) {
+        eprintln!("graph: skipped ({e})");
+    }
     let pocs: Vec<String> = std::fs::read_dir(dir.join("pocs"))
         .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
         .unwrap_or_default();
-    std::fs::write(dir.join("report.html"), html_with_pocs(target, findings, &meta, &pocs))?;
+    std::fs::write(dir.join("report.html"), redactor.text(&html_with_pocs(target, findings, &meta, &pocs)))?;
     typst_report(target, findings, dir)
 }
 

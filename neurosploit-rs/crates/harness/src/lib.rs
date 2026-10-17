@@ -8,6 +8,7 @@
 
 pub mod agents;
 pub mod assurance;
+pub mod authz_matrix;
 pub mod attack_graph;
 pub mod audit;
 pub mod belief;
@@ -16,9 +17,12 @@ pub mod budget;
 pub mod capability;
 pub mod chain;
 pub mod claims;
+pub mod collection;
 pub mod compliance;
 pub mod creds;
 pub mod cvss;
+pub mod deliverables;
+pub mod graph_memory;
 pub mod grounding;
 pub mod hygiene;
 pub mod inbox;
@@ -33,6 +37,7 @@ pub mod poc;
 pub mod pomdp;
 pub mod proxy;
 pub mod prosecutor;
+pub mod redact;
 pub mod provenance;
 pub mod models;
 pub mod netguard;
@@ -47,6 +52,7 @@ pub mod sandbox;
 pub mod sarif;
 pub mod scope;
 pub mod taint;
+pub mod traces;
 pub mod transport;
 pub mod types;
 pub mod typesafe;
@@ -54,6 +60,7 @@ pub mod typesafe_agent;
 pub mod uncertainty;
 pub mod validation;
 pub mod waf;
+pub mod wire;
 
 pub use agents::{Agent, Library};
 pub use models::{

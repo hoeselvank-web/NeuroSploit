@@ -1,4 +1,4 @@
-//! NeuroSploit v4.1.0 — interactive harness + CLI (`run` / `whitebox` / `agents` / `models`).
+//! NeuroSploit — interactive harness + CLI (`run` / `whitebox` / `agents` / `models`).
 
 mod rectify;
 mod repl;
@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "neurosploit",
     version,
-    about = "NeuroSploit v4.1.0 — multi-model autonomous pentest harness",
-    long_about = "NeuroSploit v4.1.0 — a Rust multi-model harness that drives a pool of LLMs \
+    about = "NeuroSploit v4.3.3 — multi-model autonomous pentest harness",
+    long_about = "NeuroSploit v4.3.3 — a Rust multi-model harness that drives a pool of LLMs \
 (API key or local subscription: Claude/Codex/Gemini/Grok/OpenCode/Hermes) to autonomously test a target. \
 After recon it INTELLIGENTLY selects only the agents matching the discovered surface, runs \
 them in parallel, then validates every finding by cross-model voting before reporting.\n\n\
@@ -83,6 +83,19 @@ struct Cli {
     /// exact same pipeline without it, so runs can be compared with/without.
     #[arg(long = "typesafe", global = true)]
     typesafe: Option<String>,
+    /// Authorization matrix engine: on|off|auto (auto runs when --creds carries
+    /// >=2 identities across >=2 privilege tiers). Deterministic, no model calls.
+    #[arg(long = "authz-matrix", global = true)]
+    authz_matrix: Option<String>,
+    /// Neo4j for the attack graph (bolt://host:7687 or http://host:7474).
+    /// Falls back to NEO4J_URI; credentials only via NEO4J_USER / NEO4J_PASSWORD.
+    #[arg(long = "neo4j", global = true)]
+    neo4j: Option<String>,
+    /// Import an API collection (Postman / OpenAPI / Swagger / HAR, JSON) as
+    /// known in-scope surface: its endpoints are injected into every agent and
+    /// tested directly, alongside what recon discovers.
+    #[arg(long = "collection", global = true)]
+    collection: Option<String>,
     /// Decision backend for the calibrated System One layer:
     /// typesafe (hosted API, needs TYPESAFE_API_KEY) or laya (local, free,
     /// open-source — downloads the model on first use and keeps evidence on the
@@ -178,7 +191,7 @@ enum Cmd {
         #[arg(long = "revalidate-poc")]
         revalidate_poc: bool,
         /// Map findings onto compliance controls in the report: pci-dss, hipaa,
-        /// soc2 (repeatable or comma-separated).
+        /// soc2, gdpr (repeatable or comma-separated).
         #[arg(long = "compliance")]
         compliance: Vec<String>,
         /// Open a Jira card per finding (needs the jira integration enabled).
@@ -217,6 +230,24 @@ enum Cmd {
         #[arg(long = "out")]
         out: Option<String>,
     },
+    /// Attack graph for a finished run (web + internal network): attack chains
+    /// with local vs chain severity, next moves, a Cypher export — and, with
+    /// --push (or NEO4J_URI set), MERGE into Neo4j and reason over paths
+    /// accumulated across runs
+    Graph {
+        /// Run id (`ns-…`) or a path to the run directory.
+        run: String,
+        /// Internal-network graph JSON to merge (as saved by `internal --save`);
+        /// defaults to `<run>/internal-graph.json` when present.
+        #[arg(long = "internal")]
+        internal: Option<String>,
+        /// Push to Neo4j and read accumulated paths back.
+        #[arg(long = "push")]
+        push: bool,
+        /// How many chains to print.
+        #[arg(long = "top", default_value_t = 5)]
+        top: usize,
+    },
     /// Verify a finished run's audit trail — the hash chain and, with --anchor,
     /// the signed anchors that catch truncation and silent rebuilds.
     Audit {
@@ -250,6 +281,12 @@ enum Cmd {
         /// Write the demoted findings back to findings.json.
         #[arg(long = "apply")]
         apply: bool,
+        /// Re-test only this finding id (default: every finding).
+        #[arg(long = "only")]
+        only: Option<String>,
+        /// Emit the results as JSON (one object per finding) instead of a table.
+        #[arg(long = "json")]
+        json: bool,
     },
     /// Assemble/print/verify a run's assurance bundle (P1–P5 in one manifest).
     Assurance {
@@ -318,6 +355,9 @@ enum Cmd {
         /// Economy preset for a short, low-cost review (see `run --quick`).
         #[arg(long)]
         quick: bool,
+        /// Vulnerability-research mode: hunt a NOVEL, CVE-reportable bug (known-CVE dedup + patch-diff variant analysis).
+        #[arg(long)]
+        research: bool,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -359,6 +399,9 @@ enum Cmd {
         /// Economy preset for a short, low-cost test (see `run --quick`).
         #[arg(long)]
         quick: bool,
+        /// Vulnerability-research mode (see `whitebox --research`).
+        #[arg(long)]
+        research: bool,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -829,9 +872,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Audit { run, anchor } => handle_audit(&base, &run, anchor)?,
         Cmd::Traffic { run } => handle_traffic(&base, &run)?,
         Cmd::Sarif { run, out } => handle_sarif(&base, &run, out.as_deref())?,
+        Cmd::Graph { run, internal, push, top } => handle_graph(&base, &run, internal.as_deref(), push, top, cli.neo4j.as_deref()).await?,
         Cmd::Assurance { run, verify } => handle_assurance(&base, &run, verify)?,
         Cmd::Compliance { run, framework, include_leads } => handle_compliance(&base, &run, &framework, include_leads)?,
-        Cmd::Poc { run, repeats, apply } => handle_poc(&base, &run, repeats, apply).await?,
+        Cmd::Poc { run, repeats, apply, only, json } => handle_poc(&base, &run, repeats, apply, only, json).await?,
         Cmd::Sandbox { cmd } => handle_sandbox(cmd).await?,
         Cmd::Capability { cmd } => handle_capability(cmd)?,
         Cmd::Provenance { cmd } => handle_provenance(cmd)?,
@@ -840,6 +884,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Run { url, models, max_agents, vote_n, chain_depth, recon, quick, offline, subscription, mcp, creds, focus, objective, out_of_scope, in_scope, scope_file, environment, policy, budget, token_limit, deep_test_limit, coverage_first, depth_first, sample_per_route, revalidate_poc, compliance, jira, only, verbose } => {
             let url = if url.starts_with("http") { url } else { format!("https://{url}") };
+            // A wildcard target (`*.zoom.us`) is domain-wide: seed recon with the
+            // apex (a literal `*.zoom.us` has no DNS record to probe) and widen
+            // the grant to every subdomain so enumeration stays in scope.
+            let mut in_scope = in_scope;
+            let url = {
+                let h = harness::scope::host_of(&url);
+                if let Some(apex) = h.strip_prefix("*.") {
+                    in_scope.push(format!("*.{apex}"));
+                    if recon < 3 { /* leave as set; recon arg is explicit here */ }
+                    format!("https://{apex}")
+                } else { url }
+            };
             let mut cfg = RunConfig::new(&url);
             cfg.max_agents = max_agents;
             cfg.vote_n = vote_n;
@@ -870,6 +926,10 @@ async fn main() -> anyhow::Result<()> {
             cfg.sandbox = cli.sandbox.clone();
             cfg.revalidate_poc = revalidate_poc;
             cfg.compliance = revalidate_split(&compliance);
+            cfg.authz_matrix = cli.authz_matrix.clone();
+            cfg.creds_file = creds.clone();
+            cfg.neo4j = cli.neo4j.clone();
+            apply_collection(&mut cfg, cli.collection.as_deref())?;
             if !models.is_empty() {
                 cfg.models = models;
             }
@@ -880,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
             let ig = harness::integrations::Integrations::load(&repl::proj_dir());
             post_integrations(&ig, &url, &out, jira, false, None).await;
         }
-        Cmd::Whitebox { path, models, max_agents, vote_n, chain_depth, recon, quick, offline, subscription, jira, only, verbose } => {
+        Cmd::Whitebox { path, models, max_agents, vote_n, chain_depth, recon, quick, research, offline, subscription, jira, only, verbose } => {
             let path = resolve_source(&base, &path)?; // local path OR github URL/owner/repo
             let mut cfg = RunConfig::new(&path);
             cfg.max_agents = max_agents;
@@ -891,6 +951,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.subscription = subscription;
             cfg.verbose = verbose;
             cfg.pinned = parse_only(&only);
+            cfg.research = research;
             if quick { apply_quick(&mut cfg); }
             if !models.is_empty() {
                 cfg.models = models;
@@ -900,7 +961,7 @@ async fn main() -> anyhow::Result<()> {
             let ig = harness::integrations::Integrations::load(&repl::proj_dir());
             post_integrations(&ig, &path, &out, jira, false, None).await;
         }
-        Cmd::Greybox { repo, url, models, creds, focus, max_agents, vote_n, chain_depth, recon, quick, offline, subscription, mcp, only, verbose } => {
+        Cmd::Greybox { repo, url, models, creds, focus, max_agents, vote_n, chain_depth, recon, quick, research, offline, subscription, mcp, only, verbose } => {
             let repo = resolve_source(&base, &repo)?; // local path OR github URL/owner/repo
             let url = if url.starts_with("http") { url } else { format!("https://{url}") };
             let mut cfg = RunConfig::new(&url);
@@ -914,6 +975,8 @@ async fn main() -> anyhow::Result<()> {
             cfg.verbose = verbose;
             cfg.instructions = focus;
             cfg.pinned = parse_only(&only);
+            cfg.research = research;
+            apply_collection(&mut cfg, cli.collection.as_deref())?;
             if quick { apply_quick(&mut cfg); }
             if !models.is_empty() {
                 cfg.models = models;
@@ -991,6 +1054,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.verbose = verbose;
             cfg.instructions = focus;
             cfg.auth = auth;
+            apply_collection(&mut cfg, cli.collection.as_deref())?;
             if !models.is_empty() { cfg.models = models; }
             let out = run_mode(&base, cfg, false, Mode::Ai).await?;
             print_findings(&out);
@@ -1201,24 +1265,54 @@ pub(crate) struct Spawned {
 /// empty and it looks like "0 findings" when the real cause is auth. Checks the
 /// primary model's provider; prints a clear warning (non-fatal).
 pub(crate) async fn subscription_preflight(cfg: &RunConfig) {
-    if !cfg.subscription || cfg.offline { return; }
-    let Some(primary) = cfg.models.first() else { return };
-    let provider = ModelRef::parse(primary).provider;
-    if harness::models::cli_binary_for(&provider).is_none() { return; }
-    print!("  [*] checking {provider} subscription login… ");
-    use std::io::Write; let _ = std::io::stdout().flush();
-    match harness::models::cli_login_status(&provider).await {
-        harness::models::LoginStatus::LoggedIn => println!("\r  [*] {provider} subscription: logged in ✓            "),
-        harness::models::LoginStatus::NotLoggedIn => {
-            let cli = harness::models::cli_binary_for(&provider).unwrap_or("the CLI");
-            println!("\r  \x1b[1;33m[!] {provider} subscription NOT logged in\x1b[0m — run `{cli}` and log in (e.g. `claude` → /login), then retry.");
-            println!("      \x1b[2m(without login every agent returns empty — this is usually why a run finds 0.)\x1b[0m");
+    if cfg.offline { return; }
+    use std::io::Write;
+    // Check EVERY configured model, not just the primary — a 3-model jury that
+    // silently collapses to 1 (the others not logged in / no key) is the
+    // "I set 3 models and only one ran" surprise. Say which are usable and why.
+    let mut usable = 0usize;
+    for (i, id) in cfg.models.iter().enumerate() {
+        let m = ModelRef::parse(id);
+        let provider = m.provider.clone();
+        let key_present = harness::providers().iter()
+            .find(|p| p.key == provider)
+            .map(|p| std::env::var(p.env_key).ok().filter(|v| !v.trim().is_empty()).is_some())
+            .unwrap_or(false);
+        let has_cli = harness::models::cli_binary_for(&provider).is_some();
+        let role = if i == 0 { "primary" } else { "voter" };
+
+        // API key always works (subscription or not).
+        if key_present {
+            println!("  [*] {id} \x1b[2m({role})\x1b[0m — API key present ✓");
+            usable += 1;
+            continue;
         }
-        harness::models::LoginStatus::NotInstalled => {
-            let cli = harness::models::cli_binary_for(&provider).unwrap_or("?");
-            println!("\r  \x1b[1;33m[!] subscription CLI `{cli}` for {provider} is not installed\x1b[0m — install it or use an API key (drop --subscription).");
+        // Subscription path: needs a logged-in CLI for this provider.
+        if cfg.subscription && has_cli {
+            print!("  [*] checking {id} ({role}) subscription login… ");
+            let _ = std::io::stdout().flush();
+            match harness::models::cli_login_status(&provider).await {
+                harness::models::LoginStatus::LoggedIn => { println!("\r  [*] {id} \x1b[2m({role})\x1b[0m — subscription logged in ✓        "); usable += 1; }
+                harness::models::LoginStatus::Unknown => { println!("\r  [*] {id} \x1b[2m({role})\x1b[0m — login state unknown (will try)   "); usable += 1; }
+                harness::models::LoginStatus::NotLoggedIn => {
+                    let cli = harness::models::cli_binary_for(&provider).unwrap_or("the CLI");
+                    println!("\r  \x1b[1;33m[!] {id} ({role}) NOT logged in\x1b[0m — run `{cli}` and log in, or export {}'s API key. This model will be SKIPPED.        ", provider.to_uppercase());
+                }
+                harness::models::LoginStatus::NotInstalled => {
+                    let cli = harness::models::cli_binary_for(&provider).unwrap_or("?");
+                    println!("\r  \x1b[1;33m[!] {id} ({role}) — subscription CLI `{cli}` not installed\x1b[0m. This model will be SKIPPED.        ");
+                }
+            }
+            continue;
         }
-        harness::models::LoginStatus::Unknown => println!("\r  [*] {provider} subscription: login state unknown (continuing)   "),
+        // Not subscription-capable and no key: unusable.
+        let hint = if has_cli { "add --subscription and log in, or export its API key" } else { "export its API key (this provider is API-key only, e.g. qwen needs DASHSCOPE_API_KEY — or use nous:<model> for Hermes)" };
+        println!("  \x1b[1;33m[!] {id} ({role}) — no API key and not reachable\x1b[0m ({hint}). This model will be SKIPPED.");
+    }
+    if usable == 0 {
+        println!("  \x1b[1;31m[!] NONE of the configured models are usable\x1b[0m — the run will find nothing. Fix a login/key above, then /run.");
+    } else if usable < cfg.models.len() {
+        println!("  \x1b[2m→ {usable}/{} models usable; validation/voting runs with the usable ones only.\x1b[0m", cfg.models.len());
     }
 }
 
@@ -1258,7 +1352,7 @@ pub(crate) fn spawn_engagement(base: &Path, mut cfg: RunConfig, mcp: bool, mode:
     println!("  │  ua     : {ua}");
     write_status(&workdir, "running", &format!("\"target\":{:?}", cfg.target));
 
-    println!("  ┌─ NeuroSploit v4.1.0  ·  by Joas A Santos & Red Team Leaders");
+    println!("  ┌─ NeuroSploit v{}  ·  by Joas A Santos & Red Team Leaders", env!("CARGO_PKG_VERSION"));
     println!("  │  run id : {run_id}");
     println!("  │  target : {}", cfg.target);
     println!("  │  models : {}", cfg.models.join(", "));
@@ -1737,6 +1831,82 @@ fn handle_traffic(base: &std::path::Path, run: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn handle_graph(base: &std::path::Path, run: &str, internal: Option<&str>, push: bool, top: usize, neo4j: Option<&str>) -> anyhow::Result<()> {
+    use harness::graph_memory as gm;
+    let dir = resolve_run(base, run)?;
+    let findings = load_findings(&dir)?;
+    let target = std::fs::read_to_string(dir.join("meta.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("target").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or_else(|| run.to_string());
+    let run_id = dir.file_name().and_then(|s| s.to_str()).unwrap_or("run").to_string();
+    let ipath = internal.map(std::path::PathBuf::from).unwrap_or_else(|| dir.join("internal-graph.json"));
+    let ig: Option<harness::internal::InternalGraph> = std::fs::read_to_string(&ipath).ok().and_then(|t| serde_json::from_str(&t).ok());
+    if internal.is_some() && ig.is_none() {
+        anyhow::bail!("{} is not a readable internal graph", ipath.display());
+    }
+    let mut b = gm::build(&target, &run_id, &findings, ig.as_ref(), None);
+    let neo = gm::Neo4j::resolve(neo4j).filter(|_| push || neo4j.is_some() || std::env::var("NEO4J_URI").is_ok());
+    if let Some(n) = &neo {
+        let mut pushed = b.clone();
+        let local = gm::chains(&pushed, 8, 50);
+        gm::record_paths(&mut pushed, &local, &run_id);
+        match n.push(&pushed, &run_id).await {
+            Ok((nn, ne)) => println!("  neo4j: merged {nn} node(s), {ne} relationship(s) → {}", n.label()),
+            Err(e) => println!("  neo4j: push failed ({e}) — continuing offline"),
+        }
+        match n.fetch_paths(&b.target_id, 500).await {
+            Ok(remote) => {
+                let before = b.edges.len();
+                b.absorb(remote);
+                println!("  neo4j: read back accumulated paths (+{} relationship(s))", b.edges.len().saturating_sub(before));
+            }
+            Err(e) => println!("  neo4j: read failed ({e})"),
+        }
+    }
+    let cs = gm::chains(&b, 8, 50);
+    let moves = gm::next_moves(&b, &cs, 12);
+    gm::record_paths(&mut b, &cs, &run_id);
+    let out = dir.join("graph");
+    std::fs::create_dir_all(&out)?;
+    std::fs::write(out.join("attack-chains.md"), gm::chains_markdown(&target, &cs, &moves))?;
+    std::fs::write(out.join("chains.json"), gm::chains_json(&cs, &moves))?;
+    let td = gm::todo(&b, &cs);
+    std::fs::write(out.join("todo.md"), gm::todo_markdown(&target, &td))?;
+    std::fs::write(out.join("todo.json"), gm::todo_json(&td))?;
+    std::fs::write(out.join("graph.cypher"), gm::export_cypher(&b, &run_id))?;
+    std::fs::write(out.join("graph.json"), gm::export_json(&b))?;
+    let confirmed = cs.iter().filter(|c| c.status == gm::Status::Confirmed).count();
+    println!(
+        "  graph: {} node(s), {} relationship(s) · {} chain(s), {} confirmed{}",
+        b.nodes.len(),
+        b.edges.len(),
+        cs.len(),
+        confirmed,
+        if ig.is_some() { " · internal network merged" } else { "" }
+    );
+    for (i, c) in cs.iter().take(top).enumerate() {
+        println!(
+            "  {}. [{}] {} — chain {}{} · conf {:.2}",
+            i + 1,
+            c.status.as_str(),
+            c.title,
+            c.chain_severity,
+            c.potential_severity.as_deref().map(|p| format!(" (→{p} if validated)")).unwrap_or_default(),
+            c.confidence
+        );
+    }
+    if !moves.is_empty() {
+        println!("  next moves:");
+        for m in moves.iter().take(top) {
+            println!("   - {m}");
+        }
+    }
+    println!("  → {}/attack-chains.md · graph.cypher · graph.json", out.display());
+    Ok(())
+}
+
 fn handle_sarif(base: &std::path::Path, run: &str, out: Option<&str>) -> anyhow::Result<()> {
     let dir = resolve_run(base, run)?;
     let findings = load_findings(&dir)?;
@@ -1745,7 +1915,7 @@ fn handle_sarif(base: &std::path::Path, run: &str, out: Option<&str>) -> anyhow:
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| v.get("target").and_then(|x| x.as_str()).map(String::from))
         .unwrap_or_else(|| run.to_string());
-    let doc = harness::sarif::to_string(&target, &findings);
+    let doc = harness::sarif::to_string(&target, &harness::redact::for_people(&findings));
     let dest = out.map(std::path::PathBuf::from).unwrap_or_else(|| dir.join("report.sarif"));
     std::fs::write(&dest, doc)?;
     println!("  {} finding(s) -> SARIF 2.1.0 at {}", findings.len(), dest.display());
@@ -1801,16 +1971,40 @@ fn handle_compliance(base: &std::path::Path, run: &str, frameworks: &[String], i
     Ok(())
 }
 
-async fn handle_poc(base: &std::path::Path, run: &str, repeats: usize, apply: bool) -> anyhow::Result<()> {
+async fn handle_poc(base: &std::path::Path, run: &str, repeats: usize, apply: bool, only: Option<String>, json: bool) -> anyhow::Result<()> {
     let dir = resolve_run(base, run)?;
     let mut findings = load_findings(&dir)?;
+    // `--only <id>`: re-test a single finding (the web console's per-finding
+    // Re-test). The scope is still derived from every finding, so the one we
+    // replay stays inside the same authorized hosts.
+    if let Some(id) = &only {
+        if !findings.iter().any(|f| &f.id == id) {
+            anyhow::bail!("no finding with id `{id}` in {}", dir.display());
+        }
+    }
     // Scope the replay to the hosts the findings are on — a re-validation run
     // must not reach past where the engagement was authorized.
     let target = findings.iter().map(|f| harness::scope::host_of(&f.endpoint)).find(|h| !h.is_empty()).unwrap_or_default();
     let policy = harness::scope::ScopePolicy::for_target(&format!("https://{target}"));
     let validator = harness::poc::PocValidator::new(policy).with_repeats(repeats);
-    println!("  re-validating {} finding(s)…", findings.len());
-    let results = validator.validate_all(&findings).await;
+    let subset: Vec<harness::types::Finding> = match &only {
+        Some(id) => findings.iter().filter(|f| &f.id == id).cloned().collect(),
+        None => findings.clone(),
+    };
+    let results = validator.validate_all(&subset).await;
+    if json {
+        // Machine-readable for the web console; it persists the history itself.
+        println!("{}", serde_json::to_string(&results)?);
+        if apply {
+            let by_id: std::collections::HashMap<&str, &harness::poc::PocResult> = results.iter().map(|r| (r.finding_id.as_str(), r)).collect();
+            for f in findings.iter_mut() {
+                if let Some(r) = by_id.get(f.id.as_str()) { harness::poc::apply(f, r); }
+            }
+            std::fs::write(dir.join("findings.json"), serde_json::to_string_pretty(&findings)?)?;
+        }
+        return Ok(());
+    }
+    println!("  re-validating {} finding(s)…", subset.len());
     for r in &results {
         let color = match r.reproduction {
             harness::poc::Reproduction::Reproduced => "1;32",
@@ -1905,8 +2099,9 @@ fn handle_provenance(cmd: ProvCmd) -> anyhow::Result<()> {
             }
             // A marker carrying this build's fingerprint came from this binary;
             // one that does not still came from NeuroSploit, just elsewhere.
-            let mine = marks.iter().filter(|m| m.contains(&Provenance::process().build[..6])).count();
-            println!("  \x1b[2m{mine} of them minted by this build ({}), the rest by another\x1b[0m", Provenance::process().build);
+            let bld = Provenance::process().build;
+            let mine = marks.iter().filter(|m| m.contains(&bld[..6.min(bld.len())])).count();
+            println!("  \x1b[2m{mine} of them minted by this build ({bld}), the rest by another\x1b[0m");
         }
         ProvCmd::Verify { dir } => {
             let dir = std::path::Path::new(&dir);
@@ -2050,6 +2245,19 @@ fn apply_quick(cfg: &mut RunConfig) {
     cfg.max_agents = 6;
     cfg.budget = Budget::with_mode(Mode::Eco);
     println!("  \x1b[2mquick: economy preset — 1 voter, 1 chain round, light recon, ≤6 agents, eco budget\x1b[0m");
+}
+
+/// Validate and attach an imported API collection (Postman/OpenAPI/HAR) so a
+/// bad file or format fails on the command line, not mid-run, and the operator
+/// sees how many endpoints were seeded.
+fn apply_collection(cfg: &mut RunConfig, path: Option<&str>) -> anyhow::Result<()> {
+    let Some(path) = path.filter(|p| !p.trim().is_empty()) else { return Ok(()) };
+    let eps = harness::collection::parse_path(path)
+        .map_err(|e| anyhow::anyhow!("--collection {path}: {e}"))?;
+    let kind = if std::path::Path::new(path).is_dir() { "directory" } else { "file" };
+    println!("  \x1b[2mcollection: imported {} endpoint(s) from {kind} {} — tested as known surface\x1b[0m", eps.len(), path);
+    cfg.api_collection = Some(path.to_string());
+    Ok(())
 }
 
 /// Egress route, out-of-band channel and inbound SMS.

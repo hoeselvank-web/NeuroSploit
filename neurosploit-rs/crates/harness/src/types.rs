@@ -213,6 +213,19 @@ pub struct RunConfig {
     /// more recon rounds, more active enumeration, and auto-installing tools.
     #[serde(default = "default_recon")]
     pub recon_intensity: usize,
+    /// Vulnerability-research mode: hunt for NOVEL, CVE-reportable issues in a
+    /// source repo — research known CVEs/advisories to de-duplicate, do
+    /// patch-diff variant analysis (incomplete-fix bypasses, sibling sinks),
+    /// and gate strictly on novelty. Steers whitebox/greybox.
+    #[serde(default)]
+    pub research: bool,
+    /// Operator-declared authorization reference (e.g. a bug-bounty program URL
+    /// like https://hackerone.com/zoom-private). Recorded in the audit trail
+    /// and added to the rules-of-engagement context so the engagement is framed
+    /// as the authorized test it is. Does NOT widen scope — the grant still
+    /// comes from the target/scope-file/capability.
+    #[serde(default)]
+    pub authorization: Option<String>,
     /// Opt-in: when the app requires email confirmation to register, allow the
     /// agent to use a free disposable-inbox API (mail.tm) to read the code/link.
     /// Off by default. Account creation is still capped by the safety guardrail.
@@ -273,11 +286,28 @@ pub struct RunConfig {
     /// `pci-dss`·`hipaa`·`soc2`.
     #[serde(default)]
     pub compliance: Vec<String>,
+    /// Authorization matrix engine: `on`|`off`|`auto` (auto = run when
+    /// `creds_file` loads >=2 identities across >=2 privilege tiers).
+    #[serde(default)]
+    pub authz_matrix: Option<String>,
+    /// Path to a `creds.yaml` carrying the multi-identity block the matrix
+    /// engine sweeps (admin/readonly/tenant/anonymous + sample values).
+    #[serde(default)]
+    pub creds_file: Option<String>,
+    /// Neo4j endpoint for the attack graph (bolt:// or http(s)://). Falls back
+    /// to `NEO4J_URI`. Credentials only from `NEO4J_USER`/`NEO4J_PASSWORD`.
+    #[serde(default)]
+    pub neo4j: Option<String>,
     /// How much compute to spend and where. Defaults to unlimited, which is the
     /// behaviour that existed before budgets — an operator who asks for nothing
     /// gets the full run.
     #[serde(default)]
     pub budget: crate::budget::Budget,
+    /// Path to an API collection (Postman / OpenAPI / HAR, JSON) whose endpoints
+    /// are imported as known in-scope surface and injected into every agent so
+    /// they are tested directly, in addition to what recon discovers.
+    #[serde(default)]
+    pub api_collection: Option<String>,
 }
 
 fn default_vote() -> usize {
@@ -315,6 +345,8 @@ impl RunConfig {
             repo: None,
             pinned: Vec::new(),
             chain_depth: 2,
+            research: false,
+            authorization: None,
             proxy: None,
             user_agent: None,
             recon_intensity: 3,
@@ -333,6 +365,10 @@ impl RunConfig {
             sandbox: None,
             revalidate_poc: false,
             compliance: Vec::new(),
+            authz_matrix: None,
+            creds_file: None,
+            neo4j: None,
+            api_collection: None,
         }
     }
 }

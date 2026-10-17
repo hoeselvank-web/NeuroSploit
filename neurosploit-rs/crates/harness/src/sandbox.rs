@@ -209,7 +209,60 @@ impl Sandbox {
     ///
     /// Returns a human-readable status. Idempotent: a second call on an
     /// already-running container is a no-op, so the pipeline can call it freely.
+    /// Is the container ENGINE (daemon) responsive? `<bin> info` only succeeds
+    /// when the daemon is up — the binary being installed is not enough.
+    async fn engine_up(&self) -> bool {
+        run(self.runtime.bin(), &["info"], Duration::from_secs(10)).await
+            .map(|o| o.code == 0).unwrap_or(false)
+    }
+
+    /// Start the container engine if it's installed but not running — so a run
+    /// with `--sandbox` doesn't fail just because Docker Desktop/Colima/the
+    /// docker daemon/the podman machine wasn't started. Tries the common starts
+    /// for the platform, then polls `<bin> info` until it comes up.
+    ///
+    /// Also probes alternative Docker socket paths (Docker Desktop on macOS
+    /// creates the socket under the logged-in user's home, which a root shell
+    /// doesn't find via the default context).
+    async fn start_engine(&self) -> Result<(), String> {
+        if self.engine_up().await { return Ok(()); }
+        // Docker Desktop socket discovery: the daemon may already be running but
+        // the default DOCKER_HOST points at a stale socket (common when running
+        // as root while Docker Desktop runs under the GUI user). Probe known
+        // alternative paths before trying to start anything.
+        if self.runtime == Runtime::Docker {
+            if let Some(sock) = find_docker_socket().await {
+                std::env::set_var("DOCKER_HOST", format!("unix://{sock}"));
+                if self.engine_up().await { return Ok(()); }
+            }
+        }
+        let starters: &[(&str, &[&str])] = match self.runtime {
+            Runtime::Docker => &[
+                ("colima", &["start"]),                 // macOS/Linux, common
+                ("systemctl", &["start", "docker"]),     // Linux systemd
+                ("service", &["docker", "start"]),       // Linux sysv
+                ("open", &["-a", "Docker"]),             // macOS Docker Desktop
+            ],
+            Runtime::Podman => &[
+                ("podman", &["machine", "start"]),
+            ],
+        };
+        for (bin, args) in starters {
+            if !which(bin) { continue; }
+            let _ = run(bin, args, Duration::from_secs(120)).await;
+            // Poll for the daemon to come up (engines take a few seconds).
+            for _ in 0..30 {
+                if self.engine_up().await { return Ok(()); }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        if self.engine_up().await { Ok(()) }
+        else { Err(format!("the {} engine is installed but not running, and could not be started automatically — start it (e.g. `colima start`, `open -a Docker`, or `sudo systemctl start docker`) and retry", self.runtime.bin())) }
+    }
+
     pub async fn ensure(&self) -> Result<String, String> {
+        // Bring the engine up first — installed-but-not-running is the common case.
+        self.start_engine().await?;
         if self.is_up().await {
             return Ok(format!("{} container `{}` already running", self.runtime.bin(), self.cfg.name));
         }
@@ -262,6 +315,40 @@ impl Sandbox {
     pub async fn teardown(&self) {
         let _ = run(self.runtime.bin(), &["rm", "-f", &self.cfg.name], Duration::from_secs(30)).await;
     }
+}
+
+/// Probe known Docker socket paths and return the first one that is actually
+/// listening. Covers Docker Desktop on macOS (socket under `/Users/<user>/`),
+/// Colima, and the standard `/var/run/docker.sock`.
+async fn find_docker_socket() -> Option<String> {
+    let mut candidates: Vec<String> = vec![
+        "/var/run/docker.sock".into(),
+    ];
+    // Docker Desktop creates sockets under each user's home.
+    if let Ok(entries) = std::fs::read_dir("/Users") {
+        for e in entries.flatten() {
+            let p = e.path().join(".docker/run/docker.sock");
+            if p.exists() {
+                candidates.push(p.display().to_string());
+            }
+        }
+    }
+    // Colima socket (macOS).
+    if let Ok(home) = std::env::var("HOME") {
+        let colima = format!("{home}/.colima/default/docker.sock");
+        if std::path::Path::new(&colima).exists() {
+            candidates.push(colima);
+        }
+    }
+    for sock in &candidates {
+        if !std::path::Path::new(sock).exists() { continue; }
+        let out = run("docker", &["--host", &format!("unix://{sock}"), "info"],
+            Duration::from_secs(5)).await;
+        if out.map(|o| o.code == 0).unwrap_or(false) {
+            return Some(sock.clone());
+        }
+    }
+    None
 }
 
 fn which(bin: &str) -> bool {

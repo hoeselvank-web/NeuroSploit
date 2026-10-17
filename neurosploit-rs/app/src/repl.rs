@@ -1,4 +1,4 @@
-//! NeuroSploit v4.2.0 — interactive session (Claude-Code / Codex / Cursor-CLI style).
+//! NeuroSploit v4.2.1 — interactive session (Claude-Code / Codex / Cursor-CLI style).
 //!
 //! Launched when `neurosploit` runs with no subcommand. A persistent REPL with
 //! real line editing (arrow-key history recall, Ctrl-A/E/K, paste), model
@@ -147,14 +147,14 @@ struct LiveCheckpoint {
 /// near-neighbour would break working commands. A test keeps the two in sync.
 pub(crate) const ACCEPTED: &[&str] = &[
     "/?", "/agents", "/attach", "/audit", "/auth", "/burp", "/cap", "/capability", "/chain", "/changed", "/clear", "/config",
-    "/context", "/continue", "/creds", "/diff", "/exclude", "/exit", "/expand", "/feed",
-    "/finding", "/findings", "/focus", "/forget", "/full", "/go", "/goal", "/graph", "/guardrail", "/guardrails", "/help",
+    "/collection", "/import-api", "/context", "/continue", "/creds", "/diff", "/exclude", "/exit", "/expand", "/feed",
+    "/pocs", "/poc", "/evidence", "/artifacts", "/finding", "/findings", "/focus", "/forget", "/full", "/go", "/goal", "/graph", "/guardrail", "/guardrails", "/help",
     "/history", "/idle", "/inscope", "/instructions", "/integration", "/integrations", "/key", "/log",
-    "/logs", "/mcp", "/memory", "/model", "/models", "/objective", "/objectives", "/observe",
+    "/authorize", "/grant", "/inscope-set", "/scope-file", "/scopefile", "/import-scope", "/authorization", "/authz", "/program", "/logs", "/mcp", "/memory", "/model", "/models", "/objective", "/objectives", "/observe",
     "/observe-only", "/offline",
-    "/onboard", "/only", "/oos", "/outofscope", "/policy", "/providers", "/proxy", "/quick", "/economy", "/eco", "/q", "/quit", "/recon",
+    "/onboard", "/only", "/oos", "/outofscope", "/policy", "/providers", "/proxy", "/class", "/classes", "/focus-class", "/compliance", "/comply", "/budget", "/research", "/quick", "/economy", "/eco", "/q", "/quit", "/recon",
     "/pause", "/repo", "/report", "/results", "/resume", "/retest", "/revalidate", "/run", "/runs",
-    "/scope", "/scope-out", "/show", "/status", "/stop", "/sub", "/subscription", "/target",
+    "/sandbox", "/scope", "/scope-out", "/show", "/status", "/stop", "/sub", "/subscription", "/target",
     "/temp-email", "/tempmail", "/theme", "/timeout", "/ua", "/url", "/useragent", "/validate",
     "/votes",
 ];
@@ -162,11 +162,11 @@ pub(crate) const ACCEPTED: &[&str] = &[
 /// All slash-commands, for Tab completion.
 const COMMANDS: &[&str] = &[
     "/help", "/onboard", "/show", "/config", "/providers", "/model", "/key", "/sub", "/target",
-    "/repo", "/auth", "/creds", "/focus", "/objective", "/scope-out", "/attach", "/context", "/mcp", "/offline",
-    "/quick", "/economy", "/eco", "/votes", "/chain", "/recon", "/tempmail", "/timeout", "/proxy", "/burp", "/ua", "/agents", "/only", "/theme", "/clear", "/run", "/stop", "/pause", "/continue", "/runs", "/results", "/report",
-    "/status", "/logs", "/diff", "/retest", "/validate", "/finding", "/expand", "/integrations",
+    "/scope-file",     "/authorization", "/class",     "/repo", "/auth", "/creds", "/collection", "/focus", "/objective", "/scope-out", "/attach", "/context", "/mcp", "/offline",
+    "/class", "/research", "/quick", "/economy", "/eco", "/sandbox", "/votes", "/chain", "/recon", "/tempmail", "/timeout", "/proxy", "/burp", "/ua", "/agents", "/only", "/theme", "/clear", "/run", "/stop", "/pause", "/continue", "/runs", "/results", "/report",
+    "/status", "/logs", "/diff", "/retest", "/validate", "/finding", "/pocs", "/expand", "/integrations",
     "/memory", "/forget", "/graph", "/inscope", "/observe", "/guardrail", "/policy",
-    "/capability", "/audit", "/quit",
+    "/compliance", "/budget", "/capability", "/audit", "/quit",
 ];
 
 /// rustyline helper: Tab-completes `/commands` and `@filesystem-paths`,
@@ -268,6 +268,7 @@ struct Session {
     max_agents: usize,
     chain_depth: usize,
     recon_intensity: usize,
+    research: bool,
     /// Opt-in disposable email (mail.tm) for register flows needing a confirmation code.
     temp_email: bool,
     /// Idle guardrail: stop a run if no NEW finding lands in this many seconds
@@ -284,9 +285,16 @@ struct Session {
     /// Named identities for multi-role access-control testing (name, header line).
     roles: Vec<(String, String)>,
     creds: Option<String>,
+    /// Imported API collection (Postman/OpenAPI/HAR) path — tested as surface.
+    collection: Option<String>,
     instructions: Option<String>,
     /// Engagement objective / rules-of-engagement context (why + what matters).
     objective: Option<String>,
+    authorization: Option<String>,
+    /// Set once the operator defines scope explicitly (scope-file, /inscope, or
+    /// a capability). While pinned, `/target` stops re-deriving the scope from
+    /// the target, so an imported allowlist is not clobbered by picking a target.
+    scope_pinned: bool,
     /// Explicit out-of-scope exclusions the agents must not touch.
     out_of_scope: Option<String>,
     /// Authorization boundary + guardrails, enforced by the harness.
@@ -299,10 +307,22 @@ struct Session {
     color: bool,
     /// Engagement scope from onboarding: web | infra | cloud | ai | skills.
     scope: &'static str,
+    /// Kali sandbox image (Some("") = default kali-rolling, Some(img) = custom,
+    /// None = off / host execution). Auto-enabled for wildcard scope when a
+    /// container runtime is available.
+    sandbox: Option<String>,
     /// Explicit agent allowlist (`/only <agent>[,agent2,...]`) — when non-empty,
     /// /run tests EXACTLY these agents and skips recon-based selection, same as
     /// the CLI's `--only` flag. Empty = normal recon-driven auto-selection.
     pinned: Vec<String>,
+    /// Compliance frameworks to map confirmed findings onto (`/compliance pci-dss,gdpr`).
+    /// Same as the CLI `--compliance` flag. Empty = no compliance mapping.
+    compliance: Vec<String>,
+    /// Reasoning-budget mode (`/budget eco|balanced|aggressive|unlimited`), and an
+    /// optional hard token ceiling (`/budget token <N>`). None = unlimited, the
+    /// default full run.
+    budget_mode: Option<String>,
+    token_limit: Option<u64>,
 }
 
 impl Default for Session {
@@ -320,6 +340,7 @@ impl Default for Session {
             max_agents: 0,
             chain_depth: 2,
             recon_intensity: 3,
+            research: false,
             temp_email: false,
             idle_secs: 300, // 5-minute idle guardrail by default
             proxy: None,
@@ -330,8 +351,11 @@ impl Default for Session {
             auth: None,
             roles: Vec::new(),
             creds: None,
+            collection: None,
             instructions: None,
             objective: None,
+            authorization: None,
+            scope_pinned: false,
             out_of_scope: None,
             policy: Default::default(),
             capability: None,
@@ -339,7 +363,11 @@ impl Default for Session {
             attachments: Vec::new(),
             color: true,
             scope: "web",
+            sandbox: None,
             pinned: Vec::new(),
+            compliance: Vec::new(),
+            budget_mode: None,
+            token_limit: None,
         }
     }
 }
@@ -440,7 +468,7 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
     let backends = harness::installed_cli_backends();
     println!("\x1b[1m");
     println!("  ███╗   ██╗███████╗██╗   ██╗██████╗  ██████╗");
-    println!("  ████╗  ██║██╔════╝██║   ██║██╔══██╗██╔═══██╗   NeuroSploit v4.2.0");
+    println!("  ████╗  ██║██╔════╝██║   ██║██╔══██╗██╔═══██╗   NeuroSploit v{}", env!("CARGO_PKG_VERSION"));
     println!("  ██╔██╗ ██║█████╗  ██║   ██║██████╔╝██║   ██║   interactive harness");
     println!("  ██║╚██╗██║██╔══╝  ██║   ██║██╔══██╗██║   ██║   by Joas A Santos");
     println!("  ██║ ╚████║███████╗╚██████╔╝██║  ██║╚██████╔╝   & Red Team Leaders");
@@ -448,7 +476,7 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
     println!("  {} agents loaded · detected logins: {}", lib.total(),
         if backends.is_empty() { "none (use API keys)".into() } else { backends.join(", ") });
     println!("  Type \x1b[36m/help\x1b[0m to start, \x1b[36m/run\x1b[0m to launch, \x1b[36m/quit\x1b[0m to exit. (↑/↓ recalls commands)");
-    println!("  \x1b[2mOr just describe it in any language:\x1b[0m \x1b[36mtesta https://loja.com com opus, foco em SQLi, roda\x1b[0m\n");
+    println!("  \x1b[2mOr just describe it in any language:\x1b[0m \x1b[36mtest https://shop.com with opus, focus on SQLi, run\x1b[0m\n");
 
     let mut s = Session::default();
     let resumed = load_session(&mut s);
@@ -695,9 +723,56 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
                     let ts: Vec<String> = arg.split(',').map(|x| x.trim()).filter(|x| !x.is_empty())
                         .map(|x| crate::rectify::rectify_url(x).unwrap_or_else(|| x.to_string()))
                         .collect();
-                    s.target = Some(ts.join(","));
-                    if ts.len() > 1 { println!("  targets ({}): {}", ts.len(), ts.join(", ")); println!("  \x1b[2m/run tests them sequentially, one report each\x1b[0m"); }
-                    else { println!("  target: {}", ts.first().cloned().unwrap_or_default()); }
+                    // A wildcard target (`*.zoom.us`) means "the whole domain":
+                    // authorize the apex AND every subdomain, and seed recon with
+                    // the apex (a literal `*.zoom.us` has no DNS record to probe),
+                    // so subdomain enumeration happens inside the wildcard scope.
+                    let mut wildcard_domain: Option<String> = None;
+                    let seeds: Vec<String> = ts.iter().map(|t| {
+                        let h = harness::scope::host_of(t);
+                        if let Some(apex) = h.strip_prefix("*.") {
+                            wildcard_domain = Some(apex.to_string());
+                            format!("https://{apex}")
+                        } else { t.clone() }
+                    }).collect();
+                    s.target = Some(seeds.join(","));
+                    // Re-derive the authorized scope from the NEW target unless a
+                    // verified capability sets the ceiling. Without this, a scope
+                    // left over from a previous session (persisted in the project
+                    // session) keeps denying every new target — the operator sets
+                    // /target zoom.us but the grant still says *.example.com. With
+                    // no capability, the target the operator picks IS the grant
+                    // (same model as `neurosploit run <url>`); explicit excludes
+                    // and guardrails are preserved.
+                    // Only re-derive when scope was NOT set explicitly (no
+                    // imported scope-file, no /inscope, no capability) — otherwise
+                    // picking a target would clobber the operator's allowlist.
+                    let rederive = s.capability.is_none() && !s.scope_pinned;
+                    if rederive {
+                        let keep_exclude = s.policy.exclude.clone();
+                        let keep_soft = s.policy.soft.clone();
+                        let mut np = harness::scope::ScopePolicy::for_target(&seeds[0]);
+                        for extra in seeds.iter().skip(1) { np.allow(&harness::scope::host_of(extra)); }
+                        // Each wildcard entry widens the grant to all its subdomains.
+                        for t in &ts {
+                            let h = harness::scope::host_of(t);
+                            if h.starts_with("*.") { np.allow(&h); }
+                        }
+                        np.exclude = keep_exclude;
+                        np.soft = keep_soft;
+                        s.policy = np;
+                    }
+                    if ts.len() > 1 { println!("  targets ({}): {}", ts.len(), seeds.join(", ")); println!("  \x1b[2m/run tests them sequentially, one report each\x1b[0m"); }
+                    else { println!("  target: {}", seeds.first().cloned().unwrap_or_default()); }
+                    if s.scope_pinned {
+                        println!("  \x1b[2mscope: using the imported scope ({}) — target must fall inside it\x1b[0m", s.policy.summary());
+                    } else if let Some(d) = &wildcard_domain {
+                        println!("  \x1b[2mscope: *.{d} — apex + all subdomains authorized; recon will enumerate subdomains\x1b[0m");
+                        // Nudge recon toward active subdomain discovery for a domain-wide engagement.
+                        if s.recon_intensity < 3 { s.recon_intensity = 3; }
+                    } else if s.capability.is_none() {
+                        println!("  \x1b[2mscope: authorized against this target (add more with /inscope, exclude with /scope-out)\x1b[0m");
+                    }
                 }
             }
             "/timeout" | "/idle" => {
@@ -713,9 +788,19 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
             }
             "/ua" | "/useragent" => {
                 match arg {
-                    "" => println!("  user-agent: {}  \x1b[2m(identifies NeuroSploit traffic)\x1b[0m",
-                        s.user_agent.clone().unwrap_or_else(harness::pipeline::default_user_agent)),
-                    "default" | "reset" => { s.user_agent = None; println!("  user-agent reset to default (NeuroSploit)"); }
+                    "" => {
+                        println!("  user-agent: {}  \x1b[2m(attribution is also carried by the X-NeuroSploit-Scan header)\x1b[0m",
+                            s.user_agent.clone().unwrap_or_else(harness::pipeline::default_user_agent));
+                        println!("  \x1b[2m/ua browser  → a real Chrome UA (recommended behind a WAF/CDN — a scanner UA can be blocked/challenged and cause false negatives)\x1b[0m");
+                        println!("  \x1b[2m/ua identify → the NeuroSploit UA (max transparency; some programs require it) · /ua <custom> · /ua reset\x1b[0m");
+                    }
+                    "default" | "reset" | "identify" => { s.user_agent = None; println!("  user-agent: NeuroSploit identifying UA (most transparent — defenders see the scan in the UA)"); }
+                    "browser" | "chrome" | "realistic" | "stealth" => {
+                        let ua = harness::pipeline::realistic_user_agent().to_string();
+                        s.user_agent = Some(ua.clone());
+                        println!("  \x1b[32muser-agent: realistic browser\x1b[0m — {ua}");
+                        println!("  \x1b[2mbetter test quality behind a WAF/CDN; the scan stays attributable via the X-NeuroSploit-Scan header\x1b[0m");
+                    }
                     u => { s.user_agent = Some(u.to_string()); println!("  user-agent: {u}"); }
                 }
             }
@@ -772,6 +857,22 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
                 else if arg == "clear" { s.creds = None; println!("  creds cleared"); }
                 else { s.creds = Some(arg.to_string()); println!("  creds file: {arg}"); }
             }
+            "/collection" | "/import-api" => {
+                if arg.is_empty() {
+                    println!("  api collection: {}", s.collection.clone().unwrap_or_else(|| "(none) — import with /collection <file> (Postman/OpenAPI/HAR, JSON)".into()));
+                } else if arg == "clear" {
+                    s.collection = None; println!("  api collection cleared");
+                } else {
+                    match harness::collection::parse_path(arg) {
+                        Ok(eps) => {
+                            let kind = if std::path::Path::new(arg).is_dir() { "directory" } else { "file" };
+                            s.collection = Some(arg.to_string());
+                            println!("  api collection: imported {} endpoint(s) from {kind} {arg} — tested as known surface", eps.len());
+                        }
+                        Err(e) => println!("  \x1b[33m⚠ {e}\x1b[0m"),
+                    }
+                }
+            }
             "/focus" | "/instructions" => {
                 if arg == "clear" { s.instructions = None; println!("  focus cleared"); continue; }
                 if arg.is_empty() { println!("  focus: {}", s.instructions.clone().unwrap_or_else(|| "(none)".into())); continue; }
@@ -786,6 +887,120 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
                 }
                 s.objective = Some(arg.to_string());
                 println!("  objective set — steers what agents prioritise and what counts as impact");
+            }
+            "/authorize" | "/inscope-set" | "/grant" => {
+                // Declare the whole authorized scope in ONE line for a direct
+                // engagement (a client test with written authorization — no
+                // bug-bounty program or capability token needed). Accepts
+                // multiple hosts / *.domains / CIDRs / URL-prefixes, sets them
+                // as the hard grant, and pins it so a later /target doesn't
+                // re-derive. The operator asserts they are authorized for these.
+                if arg.trim().is_empty() || arg.trim() == "clear" {
+                    if arg.trim() == "clear" { s.policy.hard.clear(); s.scope_pinned = false; println!("  authorized scope cleared"); continue; }
+                    println!("  declare what you're authorized to test (one line, direct engagement):");
+                    println!("    /authorize app.client.com *.client.com 10.0.0.0/24 https://api.client.com/v2");
+                    println!("  current: {}", s.policy.summary());
+                    continue;
+                }
+                let entries: Vec<&str> = arg.split([',', ';', ' ']).map(str::trim).filter(|x| !x.is_empty()).collect();
+                let keep_exclude = s.policy.exclude.clone();
+                let keep_soft = s.policy.soft.clone();
+                let mut np = harness::scope::ScopePolicy::default();
+                np.exclude = keep_exclude;
+                np.soft = keep_soft;
+                let mut added = 0usize;
+                for e in &entries { let before = np.hard.len(); np.allow(e); added += np.hard.len().saturating_sub(before); }
+                if np.hard.is_empty() {
+                    println!("  \x1b[33mnothing valid to authorize in: {}\x1b[0m", arg);
+                } else {
+                    s.policy = np;
+                    s.scope_pinned = true;
+                    // Seed the target so /run works immediately — whenever none
+                    // is set OR the current one falls outside the new scope.
+                    let cur_ok = s.target.as_deref().map(|t| s.policy.in_hard_scope(t)).unwrap_or(false);
+                    if !cur_ok {
+                        let had = s.target.is_some();
+                        if let Some(seed) = scope_seed_target(&s.policy) {
+                            if had { println!("  \x1b[33m⚠ previous target was outside this scope — target reset to {seed}\x1b[0m"); }
+                            s.target = Some(seed);
+                        }
+                    }
+                    println!("  \x1b[1;32m🔓 authorized scope set\x1b[0m ({} entr{}) — {}", added, if added == 1 { "y" } else { "ies" }, s.policy.summary());
+                    println!("  \x1b[2mdirect engagement — you assert written authorization for these assets. Tune limits with /guardrail · exclude with /scope-out · /run to start.\x1b[0m");
+                }
+            }
+            "/scope-file" | "/scopefile" | "/import-scope" => {
+                let path = arg.trim().trim_start_matches('@');
+                if path.is_empty() {
+                    println!("  import a scope config (hard allowlist + exclusions + guardrails):");
+                    println!("    /scope-file examples/scopes/engagement.example.yaml");
+                    println!("  current scope: {}", s.policy.summary());
+                    continue;
+                }
+                match harness::scope::ScopePolicy::from_file(std::path::Path::new(path)) {
+                    Ok(sp) => {
+                        if sp.hard.is_empty() {
+                            println!("  \x1b[33m⚠ {path} sets no hard scope — nothing would be authorized; not applied.\x1b[0m");
+                        } else {
+                            s.scope_pinned = true;
+                            s.policy = sp;
+                            println!("  \x1b[32m📋 scope imported\x1b[0m from {path} — {}", s.policy.summary());
+                            // A target left over from a previous session may be
+                            // outside the imported scope (it would be denied on
+                            // /run). Reseed it from the scope's first host so the
+                            // run is ready and consistent with what was imported.
+                            let cur_ok = s.target.as_deref().map(|t| s.policy.in_hard_scope(t)).unwrap_or(false);
+                            if !cur_ok {
+                                let had_target = s.target.is_some();
+                                if let Some(seed) = scope_seed_target(&s.policy) {
+                                    if had_target { println!("  \x1b[33m⚠ previous target was outside this scope — target reset to {seed}\x1b[0m"); }
+                                    s.target = Some(seed);
+                                }
+                            }
+                            // Optional engagement settings in the SAME file:
+                            // target, models, focus, objective, authorization,
+                            // classes — so one YAML defines the whole engagement.
+                            if let Ok(text) = std::fs::read_to_string(path) {
+                                let meta = read_engagement_meta(&text);
+                                if let Some(t) = meta.target {
+                                    if s.policy.in_hard_scope(&t) {
+                                        // A wildcard target (`*.nasa.gov`) is not a
+                                        // host to probe — seed with the apex, since
+                                        // the scope already authorizes the subdomains.
+                                        let host = harness::scope::host_of(&t);
+                                        let seed = if let Some(apex) = host.strip_prefix("*.") { format!("https://{apex}") }
+                                                   else if t.contains("://") { t.clone() } else { format!("https://{host}") };
+                                        s.target = Some(seed.clone());
+                                        println!("  \x1b[2m· target: {seed}\x1b[0m");
+                                    } else { println!("  \x1b[33m⚠ file's target {t} is outside its own scope — ignored\x1b[0m"); }
+                                }
+                                if !meta.models.is_empty() { s.models = meta.models.clone(); println!("  \x1b[2m· models: {}\x1b[0m", meta.models.join(", ")); }
+                                if let Some(f) = meta.focus { s.instructions = Some(f.clone()); println!("  \x1b[2m· focus: {f}\x1b[0m"); }
+                                if let Some(o) = meta.objective { s.objective = Some(o.clone()); println!("  \x1b[2m· objective: {o}\x1b[0m"); }
+                                if let Some(a) = meta.authorization { s.authorization = Some(a.clone()); println!("  \x1b[2m· authorization: {a}\x1b[0m"); }
+                                if !meta.classes.is_empty() {
+                                    let lib = agents::load(base);
+                                    let mut pinned: Vec<String> = Vec::new();
+                                    for c in &meta.classes { for n in agents_for_class(&lib, &c.to_lowercase()) { if !pinned.contains(&n) { pinned.push(n); } } }
+                                    if !pinned.is_empty() { s.pinned = pinned; println!("  \x1b[2m· classes: {} → {} agent(s)\x1b[0m", meta.classes.join(", "), s.pinned.len()); }
+                                }
+                            }
+                            println!("  \x1b[2mtarget: {} · /run to start · /authorization <program-url> to record the authorization\x1b[0m",
+                                s.target.clone().unwrap_or_else(|| "(set one inside this scope with /target)".into()));
+                        }
+                    }
+                    Err(e) => println!("  \x1b[31m⛔ could not read {path}: {e}\x1b[0m"),
+                }
+            }
+            "/authorization" | "/authz" | "/program" => {
+                if arg == "clear" { s.authorization = None; println!("  authorization reference cleared"); continue; }
+                if arg.is_empty() {
+                    println!("  authorization: {}", s.authorization.clone().unwrap_or_else(|| "(none) — declare the program/authorization with /authorization <url-or-text>, e.g. https://hackerone.com/<program>".into()));
+                    println!("  \x1b[2mframes the run as the authorized test it is and is recorded; it does NOT widen scope — the grant still comes from /target, /scope-file or a capability.\x1b[0m");
+                    continue;
+                }
+                s.authorization = Some(arg.to_string());
+                println!("  \x1b[32m🔏 authorization recorded\x1b[0m — {} (stay within the program's scope & rules of engagement; scope boundary still enforced)", arg);
             }
             "/scope-out" | "/outofscope" | "/oos" | "/exclude" => {
                 if arg == "clear" { s.out_of_scope = None; println!("  out-of-scope cleared"); continue; }
@@ -846,6 +1061,98 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
                 if arg.is_empty() { println!("  recon intensity: {} ({}) — set with /recon <1-4>  [1 quick · 2 standard · 3 deep · 4 exhaustive]", s.recon_intensity, lvl(s.recon_intensity)); }
                 else { s.recon_intensity = arg.parse::<usize>().unwrap_or(s.recon_intensity).clamp(1, 4); println!("  recon intensity: {} ({}) — more rounds, more enumeration, auto-installs tools", s.recon_intensity, lvl(s.recon_intensity)); }
             }
+            "/class" | "/classes" | "/focus-class" => {
+                // Focus the run on specific vuln CLASSES (idor, sqli, xss, ssrf, …):
+                // expand each class to the matching agents from the library and pin
+                // them, so /run tests exactly those classes and skips recon-based
+                // selection. Friendlier than /only for "just hunt IDOR + SQLi".
+                if arg.trim().is_empty() {
+                    println!("  focus a run on vuln classes — /class idor,sqli,xss,ssrf  (pins the matching agents)");
+                    println!("  known: idor bola sqli xss ssrf csrf ssti xxe rce lfi rfi idor redirect ssrf deserialization");
+                    println!("         auth jwt graphql race upload cors prototype-pollution nosqli command-injection");
+                    println!("  current pinned: {}", if s.pinned.is_empty() { "(none)".into() } else { s.pinned.join(", ") });
+                } else if arg.trim() == "clear" {
+                    s.pinned.clear();
+                    println!("  classes cleared — back to recon-driven selection");
+                } else {
+                    let lib = agents::load(base);
+                    let classes: Vec<String> = arg.split([',', ';', ' ']).map(str::trim).filter(|x| !x.is_empty()).map(|c| c.to_lowercase()).collect();
+                    let mut pinned: Vec<String> = Vec::new();
+                    let mut unknown: Vec<String> = Vec::new();
+                    for c in &classes {
+                        let matched = agents_for_class(&lib, c);
+                        if matched.is_empty() { unknown.push(c.clone()); }
+                        for n in matched { if !pinned.contains(&n) { pinned.push(n); } }
+                    }
+                    if pinned.is_empty() {
+                        println!("  \x1b[33mno agents matched: {}\x1b[0m — try /agents list for names, or /only <agent>", classes.join(", "));
+                    } else {
+                        s.pinned = pinned;
+                        println!("  \x1b[1;36m🎯 focus set\x1b[0m — {} class(es): {} → {} agent(s): {}",
+                            classes.len() - unknown.len(), classes.iter().filter(|c| !unknown.contains(c)).cloned().collect::<Vec<_>>().join(", "),
+                            s.pinned.len(), s.pinned.join(", "));
+                        if !unknown.is_empty() { println!("  \x1b[33m⚠ no match for:\x1b[0m {} (ignored)", unknown.join(", ")); }
+                        println!("  \x1b[2m/run tests exactly these · /class clear to unpin\x1b[0m");
+                    }
+                }
+            }
+            "/compliance" | "/comply" => {
+                // Map confirmed findings onto control frameworks in the report —
+                // same as the CLI --compliance flag.
+                let a = arg.trim().to_lowercase();
+                if a.is_empty() {
+                    println!("  compliance mapping: {}", if s.compliance.is_empty() { "(none)".into() } else { s.compliance.join(", ") });
+                    println!("  /compliance pci-dss,hipaa,soc2,gdpr   ·  /compliance none to clear");
+                } else if a == "none" || a == "clear" || a == "off" {
+                    s.compliance.clear();
+                    println!("  compliance mapping cleared");
+                } else {
+                    let known = ["pci-dss", "hipaa", "soc2", "gdpr"];
+                    let picked: Vec<String> = a.split([',', ';', ' ']).map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect();
+                    let unknown: Vec<&String> = picked.iter().filter(|p| !known.contains(&p.as_str())).collect();
+                    s.compliance = picked.iter().filter(|p| known.contains(&p.as_str())).cloned().collect();
+                    println!("  \x1b[36mcompliance:\x1b[0m {}", if s.compliance.is_empty() { "(none)".into() } else { s.compliance.join(", ") });
+                    if !unknown.is_empty() { println!("  \x1b[33m⚠ unknown framework(s):\x1b[0m {} — known: pci-dss, hipaa, soc2, gdpr", unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")); }
+                }
+            }
+            "/budget" => {
+                // Reasoning-budget mode + optional token ceiling — same as the CLI
+                // --budget / --token-limit flags. `/budget token <N>` sets the cap.
+                let parts: Vec<&str> = arg.split_whitespace().collect();
+                match parts.as_slice() {
+                    [] => {
+                        println!("  budget: {}{}",
+                            s.budget_mode.clone().unwrap_or_else(|| "unlimited".into()),
+                            s.token_limit.map(|t| format!(" · token limit {t}")).unwrap_or_default());
+                        println!("  /budget eco|balanced|aggressive|unlimited   ·  /budget token <N>");
+                    }
+                    ["token", n] | ["tokens", n] => match n.replace(['_', ','], "").parse::<u64>() {
+                        Ok(0) => { s.token_limit = None; println!("  token limit cleared"); }
+                        Ok(v) => { s.token_limit = Some(v); println!("  \x1b[36mtoken limit:\x1b[0m {v}"); }
+                        Err(_) => println!("  \x1b[33mnot a number:\x1b[0m {n}"),
+                    },
+                    [mode] => {
+                        let m = mode.to_lowercase();
+                        if m == "unlimited" || m == "off" || m == "none" {
+                            s.budget_mode = None;
+                            println!("  budget: unlimited (full run)");
+                        } else if harness::budget::Mode::parse(&m).is_some() {
+                            s.budget_mode = Some(m.clone());
+                            println!("  \x1b[36mbudget:\x1b[0m {m}");
+                        } else {
+                            println!("  \x1b[33munknown budget '{m}'\x1b[0m — use eco, balanced, aggressive or unlimited");
+                        }
+                    }
+                    _ => println!("  /budget eco|balanced|aggressive|unlimited   ·  /budget token <N>"),
+                }
+            }
+            "/research" => {
+                match arg.trim() {
+                    "on" | "true" | "1" => { s.research = true; println!("  \x1b[1;36m🔬 research mode ON\x1b[0m — whitebox/greybox will hunt a NOVEL, CVE-reportable bug (known-CVE dedup + patch-diff variant analysis)"); }
+                    "off" | "false" | "0" => { s.research = false; println!("  research mode off"); }
+                    _ => println!("  research mode: {} — /research on|off (for whitebox/greybox: find a new CVE, not a known one)", if s.research { "\x1b[36mon\x1b[0m" } else { "\x1b[2moff\x1b[0m" }),
+                }
+            }
             "/quick" | "/economy" | "/eco" => {
                 // Economy preset for a short, low-cost test — the single switch
                 // for "fast and cheap" instead of tuning each knob. The big
@@ -857,6 +1164,23 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
                 println!("  \x1b[1;32m⚡ quick mode\x1b[0m — economy preset for a short, low-cost run:");
                 println!("    1 voter · 1 chain round · light recon · ≤6 agents");
                 println!("    \x1b[2m(raise any back up with /votes /chain /recon /agents — or /run to go)\x1b[0m");
+            }
+            "/sandbox" => {
+                match arg.trim() {
+                    "" | "on" | "kali" => {
+                        s.sandbox = Some(String::new());
+                        println!("  \x1b[1;35m📦 sandbox ON\x1b[0m — agent commands run inside a Kali container (isolation + recon toolbox)");
+                        println!("    \x1b[2mThe container auto-starts on /run (Docker or Podman required).\x1b[0m");
+                    }
+                    "off" => {
+                        s.sandbox = None;
+                        println!("  sandbox off — commands run on the host");
+                    }
+                    image => {
+                        s.sandbox = Some(image.to_string());
+                        println!("  \x1b[1;35m📦 sandbox ON\x1b[0m — image: {image}");
+                    }
+                }
             }
             "/tempmail" | "/temp-email" => {
                 match arg.trim() {
@@ -1066,6 +1390,31 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
                     if live_now { println!("  \x1b[2m(run still streaming in background — /logs for what happened while browsing)\x1b[0m"); }
                 }
             }
+            "/pocs" | "/poc" | "/evidence" | "/artifacts" => {
+                // List the PoC and evidence artifacts a run produced (synthesized
+                // or agent-written), with their paths so they can be retrieved.
+                let h = history.lock().unwrap();
+                let rec = if arg.trim().is_empty() { h.last() } else { pick(&h, arg) };
+                match rec {
+                    None => println!("  no run yet — /runs to list, or /pocs <id> after a run"),
+                    Some(r) if r.workdir.is_empty() => println!("  run #{} has no workdir on record", r.id),
+                    Some(r) => {
+                        let dir = std::path::Path::new(&r.workdir);
+                        let mut any = false;
+                        for (sub, label) in [("pocs", "PoC scripts"), ("evidence", "evidence")] {
+                            let p = dir.join(sub);
+                            let mut files: Vec<String> = std::fs::read_dir(&p).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
+                            files.sort();
+                            if !files.is_empty() {
+                                any = true;
+                                println!("  \x1b[1m{label}\x1b[0m ({}):", p.display());
+                                for f in files { println!("    {}", p.join(&f).display()); }
+                            }
+                        }
+                        if !any { println!("  no pocs/ or evidence/ files for run #{} ({})", r.id, dir.display()); }
+                    }
+                }
+            }
             "/finding" | "/findings" => {
                 // Build the finding pool: live run if active, else a past run.
                 let pool: Vec<Finding> = match &active {
@@ -1166,6 +1515,7 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
                     // dropped it is the same lie the ceiling exists to prevent.
                     let before = s.policy.hard.len();
                     s.policy.allow(arg);
+                    s.scope_pinned = true;
                     let refused = reapply_grant(&mut s);
                     if !refused.is_empty() {
                         println!("  \x1b[33m⛔ outside the capability grant, not authorized:\x1b[0m {}", refused.join(", "));
@@ -1453,6 +1803,24 @@ fn set_key(prov: &str, key: &str, s: &mut Session) {
     }
 }
 
+/// Apply the session's compliance + reasoning-budget settings onto a RunConfig,
+/// mirroring the CLI's `--compliance` / `--budget` / `--token-limit`. No mode and
+/// no token limit leaves the default (unlimited) budget untouched.
+fn apply_session_budget(cfg: &mut RunConfig, s: &Session) {
+    cfg.compliance = s.compliance.clone();
+    if s.budget_mode.is_none() && s.token_limit.is_none() {
+        return;
+    }
+    use harness::budget::{Budget, Mode};
+    let mode = s.budget_mode.as_deref().and_then(Mode::parse).unwrap_or(Mode::Balanced);
+    let mut b = Budget::with_mode(mode);
+    if let Some(t) = s.token_limit {
+        b.token_limit = t;
+    }
+    b.sample_per_route = cfg.budget.sample_per_route.max(1);
+    cfg.budget = b;
+}
+
 async fn run(base: &Path, s: &Session, history: &mut Vec<RunRecord>) {
     enum M { Black(String), White(String), Grey { url: String, repo: String } }
     let m = match (&s.repo, &s.target) {
@@ -1471,6 +1839,7 @@ async fn run(base: &Path, s: &Session, history: &mut Vec<RunRecord>) {
     cfg.vote_n = s.vote_n;
     cfg.chain_depth = s.chain_depth;
     cfg.recon_intensity = s.recon_intensity;
+    cfg.research = s.research;
     cfg.temp_email = s.temp_email;
     cfg.proxy = s.proxy.clone();
     cfg.user_agent = s.user_agent.clone();
@@ -1486,6 +1855,7 @@ async fn run(base: &Path, s: &Session, history: &mut Vec<RunRecord>) {
         }
     };
     cfg.objective = s.objective.clone();
+    cfg.authorization = s.authorization.clone();
     cfg.out_of_scope = s.out_of_scope.clone();
     cfg.scope = s.policy.clone();
     cfg.capability = s.capability.clone();
@@ -1496,7 +1866,9 @@ async fn run(base: &Path, s: &Session, history: &mut Vec<RunRecord>) {
     cfg.oob_dns = s.oob_dns.clone();
     cfg.sms = s.sms.clone();
     cfg.auth = s.auth.clone();
+    cfg.sandbox = s.sandbox.clone();
     cfg.pinned = s.pinned.clone();
+    apply_session_budget(&mut cfg, s);
     // Multiple /auth identities → prepend the access-control (IDOR/BOLA/BFLA) directive.
     if let Some(rd) = roles_directive(&s.roles) {
         let base = cfg.instructions.clone().unwrap_or_default();
@@ -1505,6 +1877,7 @@ async fn run(base: &Path, s: &Session, history: &mut Vec<RunRecord>) {
     if let M::Grey { repo, .. } = &m {
         cfg.repo = Some(repo.clone());
     }
+    cfg.api_collection = s.collection.clone();
     crate::apply_creds(&mut cfg, s.creds.as_deref()).await;
 
     let mode = match &m { M::Grey { .. } => "greybox", M::White(_) => "white-box", M::Black(_) => "black-box" };
@@ -1560,6 +1933,7 @@ async fn start_background(base: &Path, s: &Session, reader: &mut Reader,
     cfg.vote_n = s.vote_n;
     cfg.chain_depth = s.chain_depth;
     cfg.recon_intensity = s.recon_intensity;
+    cfg.research = s.research;
     cfg.temp_email = s.temp_email;
     cfg.proxy = s.proxy.clone();
     cfg.user_agent = s.user_agent.clone();
@@ -1569,6 +1943,7 @@ async fn start_background(base: &Path, s: &Session, reader: &mut Reader,
     cfg.instructions = if s.attachments.is_empty() { s.instructions.clone() }
         else { Some(format!("{}\n\nATTACHED CONTEXT:\n{}", s.instructions.clone().unwrap_or_default(), s.attachments.join("\n\n"))) };
     cfg.objective = s.objective.clone();
+    cfg.authorization = s.authorization.clone();
     cfg.out_of_scope = s.out_of_scope.clone();
     cfg.scope = s.policy.clone();
     cfg.capability = s.capability.clone();
@@ -1579,8 +1954,11 @@ async fn start_background(base: &Path, s: &Session, reader: &mut Reader,
     cfg.oob_dns = s.oob_dns.clone();
     cfg.sms = s.sms.clone();
     cfg.auth = s.auth.clone();
+    cfg.sandbox = s.sandbox.clone();
     cfg.pinned = s.pinned.clone();
+    apply_session_budget(&mut cfg, s);
     if matches!(mode_e, crate::Mode::Grey) { cfg.repo = s.repo.clone(); }
+    cfg.api_collection = s.collection.clone();
     crate::apply_creds(&mut cfg, s.creds.as_deref()).await;
     crate::subscription_preflight(&cfg).await; // warn early if the CLI isn't logged in
 
@@ -1610,6 +1988,7 @@ async fn start_background(base: &Path, s: &Session, reader: &mut Reader,
         let crate::Spawned { task, mut rx, workdir, .. } = sp;
         let mut last_saved = 0usize;
         let mut last_activity = Instant::now(); // last sign of PROGRESS (any activity)
+        let mut last_tool_print = Instant::now() - std::time::Duration::from_secs(1); // throttle gate for ⌘/🌐/📄 lines
         let mut idle_fired = false;
         let mut tool_events = 0usize; // exec/net/read/browser activity seen
         let mut exploiting = false;   // guardrail only arms once exploitation starts
@@ -1632,7 +2011,26 @@ async fn start_background(base: &Path, s: &Session, reader: &mut Reader,
                     // open (it would corrupt the picker); the line is still in the
                     // feed for /logs once the picker closes.
                     if !quiet_task.load(Ordering::Relaxed) {
-                        if let Some(out) = crate::render_compact(&line) { let _ = printer.print(out); }
+                        // Throttle the high-volume tool-activity lines (exec/net/read —
+                        // the ⌘/🌐/📄 flood). Each printed line makes rustyline REDRAW
+                        // the input line, so dozens/sec of recon/curl echoes make the
+                        // arrow keys and backspace feel stuck while you type. Rate-limit
+                        // just these (they stay in the feed for /logs); findings, phase,
+                        // votes and notices always print immediately.
+                        let is_tool = {
+                            let t = line.split_once(": ").map(|(k, _)| k).unwrap_or("");
+                            let t = t.rsplit(' ').next().unwrap_or(t); // strip @label prefix
+                            matches!(t, "exec" | "danger" | "net" | "read")
+                        };
+                        let show = if is_tool {
+                            if last_tool_print.elapsed() >= std::time::Duration::from_millis(200) {
+                                last_tool_print = Instant::now();
+                                true
+                            } else { false }
+                        } else { true };
+                        if show {
+                            if let Some(out) = crate::render_compact(&line) { let _ = printer.print(out); }
+                        }
                     }
                     // Checkpoint on each new finding.
                     let snap = {
@@ -1788,6 +2186,127 @@ fn memory_cmd(s: &Session, arg: &str) {
 /// Project-local store: `<cwd>/.neurosploit/` so each project keeps its own
 /// session, run history and command history (resume on reopen). No DB needed —
 /// it's structured state, not semantic search.
+/// Optional engagement settings read from the SAME YAML a scope file lives in,
+/// so one file can define the whole engagement (scope + target + models + focus
+/// + classes). These are top-level keys alongside `hard:`/`exclude:`/`soft:`;
+/// all are optional. Minimal reader: scalar `key: value` and simple `- item`
+/// lists at indent 0, which is all these need.
+#[derive(Default)]
+struct EngagementMeta {
+    target: Option<String>,
+    models: Vec<String>,
+    focus: Option<String>,
+    objective: Option<String>,
+    authorization: Option<String>,
+    classes: Vec<String>,
+}
+
+fn read_engagement_meta(text: &str) -> EngagementMeta {
+    let mut m = EngagementMeta::default();
+    let mut list_key: Option<String> = None; // which top-level list we're in
+    let unq = |s: &str| s.trim().trim_matches('"').trim_matches('\'').to_string();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or(raw); // strip comments
+        if line.trim().is_empty() { continue; }
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim();
+        // A list item under a top-level engagement list key.
+        if let Some(item) = t.strip_prefix("- ") {
+            if indent > 0 { if let Some(k) = &list_key {
+                let v = unq(item);
+                if !v.is_empty() { match k.as_str() {
+                    "models" => m.models.push(v),
+                    "classes" => m.classes.push(v),
+                    _ => {}
+                }}
+            }}
+            continue;
+        }
+        let (key, val) = match t.split_once(':') { Some((k, v)) => (k.trim(), unq(v)), None => continue };
+        if indent != 0 { list_key = None; continue; } // only top-level keys here
+        list_key = None;
+        match key {
+            "target" if !val.is_empty() => m.target = Some(val),
+            "focus" if !val.is_empty() => m.focus = Some(val),
+            "objective" if !val.is_empty() => m.objective = Some(val),
+            "authorization" if !val.is_empty() => m.authorization = Some(val),
+            "models" | "classes" => {
+                if val.is_empty() { list_key = Some(key.to_string()); }
+                else { // inline comma list: `models: a, b`
+                    let items: Vec<String> = val.split([',', ';']).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+                    if key == "models" { m.models = items; } else { m.classes = items; }
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+/// A target URL to seed a run from a scope policy: the first hard entry, with a
+/// wildcard (`*.dom`) reduced to its apex (a literal `*.dom` has no DNS record).
+fn scope_seed_target(p: &harness::scope::ScopePolicy) -> Option<String> {
+    let first = p.hard.first()?.as_text();
+    if let Some(url) = first.strip_prefix("https://").or_else(|| first.strip_prefix("http://")) {
+        return Some(format!("https://{}", url.split('/').next().unwrap_or(url)));
+    }
+    if first.contains('/') { // CIDR or path — not a clean host to seed; skip.
+        if first.contains("://") { return Some(first); }
+        return None;
+    }
+    let host = first.strip_prefix("*.").unwrap_or(&first);
+    Some(format!("https://{host}"))
+}
+
+/// Expand a vuln-class keyword (idor, sqli, xss, ssrf, …) to the agent names in
+/// the library that implement it. Matches on the agent's name, title and CWE by
+/// a set of substrings per class, so `/class sqli` pins every SQLi agent
+/// (blind/error/time/union/login-bypass) without the operator naming each.
+fn agents_for_class(lib: &agents::Library, class: &str) -> Vec<String> {
+    // class -> substrings to look for in name/title/cwe (lowercased).
+    let needles: Vec<&str> = match class {
+        "idor" | "bola" => vec!["idor", "bola", "bfla", "access_control", "excessive_data"],
+        "sqli" | "sql" | "sql-injection" => vec!["sqli", "sql_inj", "orm_injection", "nosql"],
+        "nosqli" | "nosql" => vec!["nosql"],
+        "xss" => vec!["xss", "cross_site_script", "dom_clobber", "mutation_xss", "postmessage"],
+        "ssrf" => vec!["ssrf"],
+        "csrf" => vec!["csrf"],
+        "ssti" | "template-injection" => vec!["ssti", "template_injection"],
+        "xxe" => vec!["xxe"],
+        "rce" | "command-injection" | "cmdi" => vec!["command_injection", "rce", "code_injection", "expression_language", "deserialization", "log4shell"],
+        "lfi" | "path-traversal" | "traversal" => vec!["lfi", "path_traversal", "file_read", "arbitrary_file"],
+        "rfi" => vec!["rfi"],
+        "redirect" | "open-redirect" => vec!["redirect"],
+        "deserialization" | "deser" => vec!["deserialization", "pickle", "yaml_deser"],
+        "auth" | "authentication" => vec!["auth_bypass", "login_sqli", "jwt", "mfa", "oauth", "oidc", "session", "saml", "password_reset", "2fa", "two_factor", "webauthn"],
+        "jwt" => vec!["jwt"],
+        "graphql" => vec!["graphql"],
+        "race" | "race-condition" => vec!["race"],
+        "upload" | "file-upload" => vec!["file_upload", "upload"],
+        "cors" => vec!["cors"],
+        "prototype-pollution" | "prototype" | "pp" => vec!["prototype_pollution"],
+        "crlf" => vec!["crlf", "response_splitting", "header_injection"],
+        "ldap" => vec!["ldap_injection"],
+        "xpath" => vec!["xpath"],
+        "smuggling" | "request-smuggling" => vec!["smuggling", "desync", "h2c", "hop_by_hop"],
+        "cache" | "cache-poisoning" => vec!["cache"],
+        "secrets" | "exposure" => vec!["exposure", "secret", "disclosure", "env_file", "backup_file", "git_"],
+        "business-logic" | "logic" => vec!["business_logic", "price_manipulation", "coupon", "workflow_step", "idempotency"],
+        other => vec![other], // fall back to a raw substring match
+    };
+    let mut out: Vec<String> = Vec::new();
+    // Exploitation agents live in vulns/ (web classes), with ai/ and infra/ for
+    // the LLM and host/AD classes — the ones a black/grey-box run can pin.
+    let pool = lib.vulns.iter().chain(lib.ai.iter()).chain(lib.infra.iter());
+    for a in pool {
+        let hay = format!("{} {} {}", a.name, a.title, a.cwe).to_lowercase();
+        if needles.iter().any(|n| hay.contains(n)) && !out.contains(&a.name) {
+            out.push(a.name.clone());
+        }
+    }
+    out
+}
+
 pub(crate) fn proj_dir() -> std::path::PathBuf {
     let d = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(".neurosploit");
     std::fs::create_dir_all(&d).ok();
@@ -1826,6 +2345,8 @@ struct Snapshot {
     repo: Option<String>,
     auth: Option<String>,
     creds: Option<String>,
+    #[serde(default)]
+    collection: Option<String>,
     instructions: Option<String>,
     #[serde(default)]
     objective: Option<String>,
@@ -1848,6 +2369,7 @@ fn save_session(s: &Session) {
         models: s.models.clone(), subscription: s.subscription, mcp: s.mcp,
         vote_n: s.vote_n, max_agents: s.max_agents, target: s.target.clone(),
         repo: s.repo.clone(), auth: s.auth.clone(), creds: s.creds.clone(),
+        collection: s.collection.clone(),
         instructions: s.instructions.clone(),
         objective: s.objective.clone(), out_of_scope: s.out_of_scope.clone(),
         scope_in: s.policy.hard.iter().map(|p| p.as_text()).collect(),
@@ -1865,7 +2387,7 @@ fn load_session(s: &mut Session) -> bool {
     if snap.vote_n > 0 { s.vote_n = snap.vote_n; }
     s.max_agents = snap.max_agents;
     s.target = snap.target; s.repo = snap.repo; s.auth = snap.auth;
-    s.creds = snap.creds; s.instructions = snap.instructions;
+    s.creds = snap.creds; s.collection = snap.collection; s.instructions = snap.instructions;
     s.objective = snap.objective; s.out_of_scope = snap.out_of_scope;
     if let Some(soft) = snap.soft { s.policy.soft = soft; }
     for t in snap.scope_in { s.policy.allow(&t); }
@@ -2141,13 +2663,32 @@ fn show(s: &Session) {
     println!("  │  repo     : {}", s.repo.clone().unwrap_or_else(|| "(none)".into()));
     println!("  │  auth     : {}", s.auth.clone().unwrap_or_else(|| "(none)".into()));
     println!("  │  creds    : {}", s.creds.clone().unwrap_or_else(|| "(none)".into()));
+    println!("  │  collection: {}", s.collection.clone().unwrap_or_else(|| "(none — /collection to import Postman/OpenAPI/HAR)".into()));
     println!("  │  proxy    : {}", s.proxy.clone().unwrap_or_else(|| "(none — /proxy for Burp/ZAP)".into()));
     println!("  │  user-agent: {}", s.user_agent.clone().unwrap_or_else(|| "NeuroSploit (default)".into()));
     println!("  │  focus    : {}", s.instructions.clone().unwrap_or_else(|| "(none — tests everything)".into()));
     println!("  │  objective: {}", s.objective.clone().unwrap_or_else(|| "(none — /objective <goal/context>)".into()));
+    // The actual authorized hard scope (the allowlist enforced in code), not just
+    // the policy profile above — this is what /authorize, /scope-file and /inscope set.
+    let scope_desc = if s.policy.hard.is_empty() {
+        s.target.clone().map(|t| format!("(derived from target: {})", harness::scope::host_of(&t)))
+            .unwrap_or_else(|| "(none set — /authorize <hosts> or /target)".into())
+    } else {
+        let hosts: Vec<String> = s.policy.hard.iter().map(|p| p.as_text()).collect();
+        format!("{}{}", hosts.join(", "), if s.scope_pinned { "  (pinned)" } else { "" })
+    };
+    println!("  │  authorized: {}", scope_desc);
+    println!("  │  guardrails: {}", s.policy.summary());
     println!("  │  out-scope: {}", s.out_of_scope.clone().unwrap_or_else(|| "(none — /scope-out <exclusions>)".into()));
-    println!("  │  opts     : mcp={} offline={} votes={} recon={} chain-depth={} max-agents={} idle-stop={} temp-email={}",
-        onoff(s.mcp), onoff(s.offline), s.vote_n, s.recon_intensity, s.chain_depth, s.max_agents,
+    if let Some(a) = &s.authorization { println!("  │  authz ref: {a}"); }
+    if !s.pinned.is_empty() { println!("  │  pinned   : {} agent(s) — {} \x1b[2m(/only clear or /class clear to unpin)\x1b[0m", s.pinned.len(), s.pinned.join(", ")); }
+    println!("  │  sandbox  : {}", match &s.sandbox {
+        Some(img) if img.is_empty() => "📦 ON (kalilinux/kali-rolling)".to_string(),
+        Some(img) => format!("📦 ON ({img})"),
+        None => "(off — /sandbox to enable Kali container)".into(),
+    });
+    println!("  │  opts     : mcp={} offline={} votes={} recon={} chain-depth={} max-agents={} research={} idle-stop={} temp-email={}",
+        onoff(s.mcp), onoff(s.offline), s.vote_n, s.recon_intensity, s.chain_depth, s.max_agents, onoff(s.research),
         if s.idle_secs == 0 { "off".to_string() } else { format!("{}m", s.idle_secs / 60) }, onoff(s.temp_email));
     // Integrations at a glance (see /integrations for detail).
     {
@@ -2187,6 +2728,7 @@ fn help() {
     h("/repo <path|url>",   "source repo (greybox) OR skill/n8n file/folder to audit (skills scope)");
     h("/auth <value>",      "auth header (Bearer/cookie/key). Roles: /auth admin <hdr> · /auth user <hdr>");
     h("/creds <file.yaml>", "creds: jwt/header/cookie/login + ssh/windows + aws/gcp/azure + roles");
+    h("/collection <path>", "import API collection(s) — file or directory of .json (Postman/OpenAPI/HAR)");
     h("/focus <text>",      "steer the tests (or just type the instruction)");
     h("/objective <text>",  "engagement goal/context — shapes what agents prioritise & count as impact");
     h("/scope-out <text>",  "out-of-scope exclusions — host-shaped entries become ENFORCED denials");
@@ -2236,7 +2778,15 @@ fn help() {
     h("/votes <n>",         "number of validator votes per finding");
     h("/chain <n>",         "attack-chain depth (post-exploitation pivots; 0 = off)");
     h("/recon <1-4>",       "recon intensity: 1 quick · 2 standard · 3 deep · 4 exhaustive (installs tools)");
+    h("/class <a,b>",       "focus a run on vuln classes (idor,sqli,xss,ssrf,…) — pins the matching agents");
+    h("/authorize <a b c>",  "direct engagement: declare the whole authorized scope in one line (hosts/*.domains/CIDRs/URLs) — no program needed");
+    h("/scope-file <path>",  "import a ready scope config (hard allowlist + exclusions + guardrails) — e.g. examples/scopes/engagement.example.yaml");
+    h("/authorization <url>", "declare the program/authorization (e.g. a bug-bounty URL) — recorded; does NOT widen scope");
+    h("/compliance <f,…>",  "map confirmed findings onto control frameworks (pci-dss, hipaa, soc2, gdpr)");
+    h("/budget <mode|token N>", "reasoning budget: eco|balanced|aggressive|unlimited, or a token ceiling");
+    h("/research",          "whitebox/greybox: hunt a NOVEL, CVE-reportable bug (known-CVE dedup + patch-diff variant analysis)");
     h("/quick",             "economy preset: short, low-cost run (1 voter · 1 chain round · light recon · ≤6 agents)");
+    h("/sandbox [img|off]", "run agent commands inside a Kali container (isolation + recon toolbox); auto-enables for wildcard scope");
     h("/tempmail on|off",   "opt-in disposable inbox (mail.tm) to read a register confirmation code");
     h("/timeout <min>",     "idle guardrail: stop if no new finding in <min> (0 = off)");
     h("/proxy <url>|off",   "route agent HTTP through Burp/ZAP  (/burp = default :8080)");

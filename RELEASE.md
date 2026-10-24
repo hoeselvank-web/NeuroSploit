@@ -1,11 +1,72 @@
-# NeuroSploit v3.6.7 — Release Notes
+# NeuroSploit v3.6.8 — Release Notes
 
 **Release Date:** August 2026
 **Codename:** Chain & Exploit
 **License:** MIT
 **Credits:** Joas A Santos & Red Team Leaders
 
-## Highlights
+## v3.6.8 — Auth resilience, circuit breaker, recon budget, Ollama error handling, empty-evidence validation
+
+### Recon Time Budget (NEW)
+
+- **5-minute total recon budget.** Recon phase is now time-boxed to 300 seconds
+  across ALL rounds. Previously, a single recon round could run 150+ commands
+  over 15 minutes via subscription CLI, leaving no time for exploitation.
+- **Per-round budget directive.** Each recon round receives a prompt instruction
+  with its share of the time budget (e.g. "~100 seconds for this round") and a
+  command count guideline (30-50 commands max). The model is instructed to
+  prioritise high-signal actions and stop early when enough intel is gathered.
+- **Elapsed time check between rounds.** Before starting each follow-up round,
+  the pipeline checks elapsed time. If the budget is exhausted, recon stops
+  immediately and proceeds to exploitation with the intelligence gathered so far.
+
+### Auth Resilience & Circuit Breaker (NEW)
+
+- **`is_auth_failure()` detector.** New function recognises OAuth token revocation
+  (401), session expiry, invalid/revoked API keys, and "not logged in" errors from
+  subscription CLIs. Distinct from `is_exhaustion()` (quota/rate-limit) — auth
+  failures are non-recoverable without re-login or provider switch.
+- **Circuit breaker (3 consecutive auth failures → auto-pause).** A shared atomic
+  counter tracks consecutive auth failures across ALL agents. After 3 failures the
+  pool pauses the run BEFORE burning through the remaining agents on a dead token.
+  Previously, a revoked OAuth token caused all 66+ agents to silently return 0
+  findings with no pause or warning.
+- **Auth-aware park: findings preserved, fallback offered.** When auth fails the
+  run parks with a clear message:
+  `⏸ authentication failed (...). Run is PAUSED — all findings so far are SAFE.`
+  The user can `/continue openai:gpt-5.1` (or any provider) to switch and resume.
+  All `LiveCheckpoint` findings on disk are preserved across the pause.
+- **No retry burn on auth failure.** `one()` returns immediately on auth errors
+  instead of retrying 3 times against a dead token (same as quota exhaustion).
+- **Recon preserves probe facts on auth failure.** When model recon fails with an
+  auth error, the HTTP probe data is still returned and the pipeline continues
+  with probe-only intelligence instead of silently dropping everything.
+- **Phase tracking for auth pauses.** The REPL status line shows `paused (auth)`
+  (distinct from `paused (quota)`) so the operator knows the root cause at a glance.
+
+### Bugfixes
+
+- **Better Ollama/local provider error messages.** Connection-refused and timeout
+  errors now name the provider, URL, and suggest checking if the server is running.
+  Previously showed raw reqwest errors.
+- **Empty-evidence findings skip the vote and go straight to `needs-review`.**
+  Findings with no evidence are unverifiable by the adversarial validator (which
+  always rejects "no evidence" per its system prompt). Now they bypass the vote
+  and are flagged for human review instead of being silently dropped.
+- **Single-model + vote_n=1 warning.** When only one model is configured and
+  vote_n is 1, the pipeline emits a warning that validation is weaker (same model
+  validates its own findings).
+- **JSON parse resilience for local models.** `extract_findings` now logs when a
+  model returns text but no parseable JSON (previously silent drop — 0 findings
+  with no diagnostic). Also auto-fixes trailing-comma JSON (`[...,]`) which small
+  models commonly produce.
+- **Visible diagnostics when agents return 0 findings.** Pipeline emits the
+  response tail so the operator can see what the model actually returned (helps
+  debug model quality issues with local/small models).
+
+---
+
+## v3.6.7 Highlights
 
 - **CVE exploitation pipeline — 4 new agents.** `cve_version_fingerprint` (pin
   exact versions) → `cve_research_analyst` (map to NVD/GHSA, judge reachability) →

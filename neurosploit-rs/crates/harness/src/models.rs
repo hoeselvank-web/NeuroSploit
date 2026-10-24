@@ -23,13 +23,13 @@ pub struct Provider {
 pub fn providers() -> Vec<Provider> {
     vec![
         Provider { key: "anthropic", label: "Anthropic Claude", base_url: "https://api.anthropic.com/v1", env_key: "ANTHROPIC_API_KEY", kind: "cli",
-            models: vec!["claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"] },
+            models: vec!["claude-opus-5-5", "claude-mythos-5-1", "claude-opus-5", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] },
         Provider { key: "openai", label: "OpenAI (ChatGPT)", base_url: "https://api.openai.com/v1", env_key: "OPENAI_API_KEY", kind: "cli",
-            models: vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2", "gpt-5.1", "gpt-5.1-codex", "o4"] },
+            models: vec!["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2", "gpt-5.1", "gpt-5.1-codex", "o4"] },
         Provider { key: "xai", label: "xAI Grok", base_url: "https://api.x.ai/v1", env_key: "XAI_API_KEY", kind: "cli",
-            models: vec!["grok-4.5", "grok-4", "grok-4-fast"] },
+            models: vec!["grok-4.7", "grok-4.5", "grok-4", "grok-4-fast"] },
         Provider { key: "gemini", label: "Google Gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", env_key: "GEMINI_API_KEY", kind: "cli",
-            models: vec!["gemini-3-pro", "gemini-2.5-pro", "gemini-2.5-flash"] },
+            models: vec!["gemini-3-pro", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.5-flash"] },
         Provider { key: "nvidia_nim", label: "NVIDIA NIM", base_url: "https://integrate.api.nvidia.com/v1", env_key: "NVIDIA_NIM_API_KEY", kind: "api",
             models: vec!["nvidia/llama-3.3-nemotron-super-49b-v1", "deepseek-ai/deepseek-r1", "qwen/qwen2.5-coder-32b-instruct"] },
         Provider { key: "deepseek", label: "DeepSeek", base_url: "https://api.deepseek.com/v1", env_key: "DEEPSEEK_API_KEY", kind: "api",
@@ -37,7 +37,15 @@ pub fn providers() -> Vec<Provider> {
         Provider { key: "mistral", label: "Mistral", base_url: "https://api.mistral.ai/v1", env_key: "MISTRAL_API_KEY", kind: "api",
             models: vec!["mistral-large-latest", "codestral-latest"] },
         Provider { key: "qwen", label: "Qwen (DashScope)", base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", env_key: "DASHSCOPE_API_KEY", kind: "api",
-            models: vec!["qwen-max", "qwen2.5-coder-32b-instruct", "qwq-plus"] },
+            models: vec!["qwen3.8-max", "qwen3.8-omni-flash", "qwen-max", "qwen2.5-coder-32b-instruct", "qwq-plus"] },
+        // Z.ai (Zhipu / GLM). OpenAI-compatible open platform endpoint.
+        // Z.ai GLM. `kind: "cli"` so a run can drive GLM agentically through the
+        // Claude Code CLI using Z.ai's Anthropic-compatible endpoint (the Z.ai
+        // devpack "cline"/"zcode" integration) — the base URL + auth token are
+        // injected for the `claude` binary in chat_claude_stream. The plain HTTP
+        // API path (api.z.ai/api/paas/v4, OpenAI-compatible) still works too.
+        Provider { key: "zai", label: "Z.ai (GLM)", base_url: "https://api.z.ai/api/paas/v4", env_key: "ZAI_API_KEY", kind: "cli",
+            models: vec!["glm-5.3", "glm-5.2", "glm-5.1", "glm-5.3-flashx", "glm-4.6"] },
         Provider { key: "groq", label: "Groq", base_url: "https://api.groq.com/openai/v1", env_key: "GROQ_API_KEY", kind: "api",
             models: vec!["llama-3.3-70b-versatile", "qwen-2.5-coder-32b"] },
         Provider { key: "together", label: "Together AI", base_url: "https://api.together.xyz/v1", env_key: "TOGETHER_API_KEY", kind: "api",
@@ -51,7 +59,25 @@ pub fn providers() -> Vec<Provider> {
         Provider { key: "litellm", label: "LiteLLM (proxy)", base_url: "http://localhost:4000/v1", env_key: "LITELLM_API_KEY", kind: "api",
             models: vec!["gpt-4o", "claude-3-7-sonnet", "gemini/gemini-2.5-pro"] },
         Provider { key: "openrouter", label: "OpenRouter", base_url: "https://openrouter.ai/api/v1", env_key: "OPENROUTER_API_KEY", kind: "api",
-            models: vec!["anthropic/claude-opus-4-8", "qwen/qwen-2.5-coder-32b-instruct", "deepseek/deepseek-r1", "meta-llama/llama-3.3-70b-instruct"] },
+            models: vec!["anthropic/claude-opus-5-5", "anthropic/claude-mythos-5-1", "anthropic/claude-opus-4-8", "z-ai/glm-5.3", "qwen/qwen3.8-max", "deepseek/deepseek-v4.1", "meta-llama/llama-3.3-70b-instruct"] },
+        // OpenCode Zen — the curated OpenAI-compatible gateway behind the
+        // `opencode` CLI (https://opencode.ai/zen). Works two ways, like
+        // anthropic/openai/xai/gemini above: as a plain API-key provider here,
+        // or (with --subscription) driven through the locally-installed
+        // `opencode` agentic CLI on the user's own Zen/plan login — no key
+        // needed in that mode. `kind: "cli"` reflects the latter.
+        Provider { key: "opencode", label: "OpenCode Zen", base_url: "https://opencode.ai/zen/v1", env_key: "OPENCODE_API_KEY", kind: "cli",
+            models: vec!["claude-opus-5-5", "claude-mythos-5-1", "claude-opus-5", "claude-sonnet-5", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.5", "gemini-3-pro", "gemini-3.8-flash", "grok-4.7", "grok-4.5", "glm-5.3", "deepseek-v4.1", "deepseek-v4-pro", "qwen3.8-max", "kimi-k3"] },
+        // Nous Research — Hermes models via the Nous Portal. As an API-key
+        // provider here (OpenAI-compatible `inference-api.nousresearch.com`),
+        // or (with --subscription) driven through the `hermes` CLI
+        // (NousResearch/hermes-agent) on the user's OAuth Portal login
+        // (`hermes setup --portal`) — 300+ routed frontier models, no key.
+        // The Hermes portal routes 300+ models, so the model name passes through
+        // (`hermes chat -m <model> --provider nous`): `nous:qwen3.8-max` and other
+        // routed models work even though only the Hermes-family defaults are listed.
+        Provider { key: "nous", label: "Nous Research (Hermes)", base_url: "https://inference-api.nousresearch.com/v1", env_key: "NOUS_API_KEY", kind: "cli",
+            models: vec!["Hermes-4-405B", "Hermes-4-70B", "DeepHermes-3-Mistral-24B-Preview", "claude-mythos-5-1", "qwen3.8-max", "qwen3.8-omni-flash"] },
         // Azure OpenAI (OpenAI-compatible). Set AZURE_OPENAI_ENDPOINT (e.g.
         // https://<resource>.openai.azure.com), optionally AZURE_OPENAI_API_VERSION
         // (default 2024-10-21), and use `azure:<your-deployment-name>` as the model.
@@ -109,10 +135,21 @@ pub struct ChatClient {
     http: reqwest::Client,
 }
 
+/// HTTP request timeout (seconds) for an API chat completion. Large reasoning
+/// responses (GLM/DeepSeek, raised `max_tokens`) can take minutes, so the
+/// default is generous; override with `NEUROSPLOIT_HTTP_TIMEOUT` (seconds).
+fn http_timeout_secs() -> u64 {
+    std::env::var("NEUROSPLOIT_HTTP_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(300)
+}
+
 impl ChatClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(http_timeout_secs()))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         ChatClient { http }
@@ -152,7 +189,7 @@ impl ChatClient {
         };
         let body = serde_json::json!({
             "model": m.model,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens_for(&m.model),
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": system},
@@ -163,17 +200,80 @@ impl ChatClient {
         if !key.is_empty() {
             if azure { req = req.header("api-key", &key); } else { req = req.bearer_auth(&key); }
         }
-        let resp = req.send().await?;
+        let resp = req.send().await.map_err(|e| {
+            if e.is_connect() {
+                let local = matches!(p.key, "ollama" | "litellm" | "llamacpp");
+                if local {
+                    anyhow!("{} connection refused at {} — is the server running? ({})", p.key, url, e)
+                } else {
+                    anyhow!("{} connection error: {}", p.key, e)
+                }
+            } else if e.is_timeout() {
+                anyhow!("{} request timed out ({}s) for model '{}' — raise NEUROSPLOIT_HTTP_TIMEOUT, or the model may be too large/slow for this prompt", p.key, http_timeout_secs(), m.model)
+            } else {
+                anyhow!("{} request error: {}", p.key, e)
+            }
+        })?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        // Read the body explicitly: a failure here (connection dropped mid-stream,
+        // or the request timeout firing while a large response is still streaming)
+        // must surface as itself, not get silently flattened to "" and then
+        // reappear downstream as a bogus "EOF while parsing" JSON error.
+        let text = resp.text().await.map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("{} response body read timed out ({}s) for model '{}' — large/slow response was cut off mid-stream; raise NEUROSPLOIT_HTTP_TIMEOUT or lower max_tokens", p.key, http_timeout_secs(), m.model)
+            } else {
+                anyhow!("{} response body read failed (status {}) for model '{}': {}", p.key, status, m.model, e)
+            }
+        })?;
         if !status.is_success() {
             return Err(anyhow!("{} returned {}: {}", p.key, status, truncate(&text, 200)));
         }
-        let v: serde_json::Value = serde_json::from_str(&text)?;
-        let content = v["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| anyhow!("no content in response"))?;
-        Ok(content.to_string())
+        if text.trim().is_empty() {
+            return Err(anyhow!("{} returned an empty body (status {}) for model '{}'", p.key, status, m.model));
+        }
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                // Some gateways emit Server-Sent Events even when stream wasn't
+                // requested. Reassemble the answer from the `data:` frames before
+                // giving up; only then report an unparseable body (with a snippet,
+                // so a truncated/HTML/error page is actually diagnosable).
+                if let Some(sse) = parse_sse_content(&text) {
+                    if !sse.trim().is_empty() {
+                        return Ok(sse);
+                    }
+                }
+                return Err(anyhow!(
+                    "{} returned unparseable body ({} bytes, model '{}'): {} — body starts: {}",
+                    p.key, text.len(), m.model, e, truncate(text.trim_start(), 300)
+                ));
+            }
+        };
+        let choice = &v["choices"][0];
+        if choice.is_null() {
+            // Some providers signal a soft failure with an empty `choices` and an
+            // `error` object in an otherwise-200 body — surface that, not a blank.
+            let err = v["error"]["message"].as_str().unwrap_or("empty choices");
+            return Err(anyhow!("{} returned no choices: {}", p.key, truncate(err, 200)));
+        }
+        let content = extract_message_text(&choice["message"]);
+        if content.trim().is_empty() {
+            // 2xx but no usable text. The usual cause is a reasoning model that
+            // spent the whole token budget on its reasoning stream and was cut
+            // off (finish_reason="length") before emitting the answer.
+            let finish = choice["finish_reason"].as_str().unwrap_or("unknown");
+            let hint = if finish == "length" {
+                " — raised max_tokens may help, or the model is reasoning-heavy for this prompt size"
+            } else {
+                ""
+            };
+            return Err(anyhow!(
+                "{} returned empty content (finish_reason={finish}, model='{}'){hint}",
+                p.key, m.model
+            ));
+        }
+        Ok(content)
     }
 }
 
@@ -203,7 +303,7 @@ impl ChatClient {
         // Claude Code can stream structured events (tools, commands, files) which
         // we surface live as a categorized activity feed, attributed to `label`.
         if bin == "claude" {
-            return self.chat_claude_stream(label, model, &prompt, mcp_config, progress).await;
+            return self.chat_claude_stream(label, provider, model, &prompt, mcp_config, progress).await;
         }
         // Codex exec streams JSONL events (`--json`): commands it runs, agent
         // messages, file changes, token usage. Surface them live so recon and
@@ -213,6 +313,11 @@ impl ChatClient {
         }
 
         let mut cmd = Command::new(bin);
+        // Most agentic CLIs here take the prompt on stdin; opencode and hermes
+        // take it as a trailing positional argument instead — track which so we
+        // don't also pipe it into stdin below (that would just hang the child
+        // waiting on a request it already got as an argv value).
+        let mut prompt_via_stdin = true;
         match bin {
             // Codex non-interactive exec (uses the ChatGPT/Codex login), prompt on stdin.
             "codex" => {
@@ -237,13 +342,46 @@ impl ChatClient {
             "grok" => {
                 cmd.arg("--model").arg(model);
             }
+            // OpenCode CLI (`opencode run`) — non-interactive one-shot, prompt
+            // as a positional arg, not stdin. `--auto` auto-approves anything
+            // not explicitly denied (our equivalent of --dangerously-skip-permissions).
+            // MCP (Playwright) is injected via a generated opencode.json pointed
+            // at through OPENCODE_CONFIG rather than a CLI flag (opencode has none).
+            "opencode" => {
+                prompt_via_stdin = false;
+                cmd.arg("run").arg("--model").arg(model).arg("--auto");
+                if let Some(mcp) = mcp_config {
+                    match write_opencode_mcp_config(mcp) {
+                        Ok(cfg) => { cmd.env("OPENCODE_CONFIG", cfg); }
+                        Err(e) => eprintln!("  [!] opencode MCP config failed: {e}"),
+                    }
+                }
+                cmd.arg(&prompt);
+            }
+            // Hermes Agent CLI (NousResearch/hermes-agent) — single-query mode.
+            // `-q` is the prompt-supplying flag (not a stdin read); `--provider
+            // nous` pins the Nous Portal OAuth login; `-Q` quiets banner/spinner
+            // for programmatic use; `--yolo` bypasses dangerous-command prompts.
+            // No CLI-level MCP hook — Hermes falls back to its own built-in
+            // toolsets (web/terminal/computer-use) rather than our Playwright MCP.
+            "hermes" => {
+                prompt_via_stdin = false;
+                cmd.arg("chat").arg("-m").arg(model).arg("--provider").arg("nous")
+                    .arg("-Q").arg("--yolo").arg("-q").arg(&prompt);
+            }
             _ => {}
         }
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| anyhow!("spawn {} failed: {}", bin, e))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.as_bytes()).await?;
-            // Drop closes stdin so the CLI processes the prompt and exits.
+        if prompt_via_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(prompt.as_bytes()).await?;
+                // Drop closes stdin so the CLI processes the prompt and exits.
+            }
+        } else {
+            // Prompt went in as an argv value; close stdin immediately so
+            // nothing lingers waiting on it (opencode/hermes never read it).
+            drop(child.stdin.take());
         }
         // Cap a single agentic CLI turn so a stuck tool-loop can't hang the run.
         let out = match tokio::time::timeout(Duration::from_secs(600), child.wait_with_output()).await {
@@ -285,6 +423,20 @@ impl ChatClient {
         if stdout.is_empty() {
             return Err(anyhow!("{} subscription CLI returned empty output", bin));
         }
+        // Subscription CLIs report a hit session/usage limit as ordinary stdout
+        // with a ZERO exit code — a short sentence, not an error. Left as Ok it
+        // becomes a "response" the agent then fails to parse, and the run burns
+        // every remaining agent against a dead session instead of pausing. Catch
+        // the sentinel (kept short so a real finding that merely mentions "rate
+        // limit" is not misread) and surface it as exhaustion so the pool parks.
+        let low = stdout.to_lowercase();
+        let session_dead = stdout.len() < 300 && [
+            "session limit", "you've hit your", "you have hit your", "usage limit",
+            "resets ", "reset at", "try again later", "come back later",
+        ].iter().any(|k| low.contains(k));
+        if session_dead {
+            return Err(anyhow!("{} subscription session/usage limit reached: {}", bin, truncate(&stdout, 160)));
+        }
         Ok(stdout)
     }
 
@@ -294,6 +446,7 @@ impl ChatClient {
     async fn chat_claude_stream(
         &self,
         label: &str,
+        provider: &str,
         model: &str,
         prompt: &str,
         mcp_config: Option<&str>,
@@ -304,6 +457,27 @@ impl ChatClient {
             .arg("--output-format").arg("stream-json").arg("--verbose")
             .arg("--dangerously-skip-permissions")
             .env("IS_SANDBOX", "1");
+        if provider == "zai" {
+            // Z.ai GLM via the Claude Code CLI (devpack / cline / zcode): point
+            // the CLI at Z.ai's Anthropic-compatible endpoint and authenticate
+            // with the Z.ai key, so `claude --model glm-5.3` drives GLM.
+            let token = std::env::var("ZAI_API_KEY").unwrap_or_default();
+            if token.trim().is_empty() {
+                return Err(anyhow!("Z.ai GLM via CLI needs ZAI_API_KEY (get a key at https://z.ai, see https://docs.z.ai/devpack/tool/cline)"));
+            }
+            cmd.env("ANTHROPIC_BASE_URL", zai_anthropic_base_url())
+                .env("ANTHROPIC_AUTH_TOKEN", token)
+                .env_remove("ANTHROPIC_API_KEY");
+        } else {
+            // Subscription mode means the `claude` CLI must authenticate with the
+            // user's logged-in session. A stray ANTHROPIC_API_KEY in the inherited
+            // environment (e.g. an invalid/stale key saved in the web console)
+            // makes the CLI switch to API-key billing and fail with
+            // "Invalid API key · Fix external API key". Strip it so the CLI
+            // always uses the subscription login here.
+            cmd.env_remove("ANTHROPIC_API_KEY")
+                .env_remove("ANTHROPIC_AUTH_TOKEN");
+        }
         if let Some(mcp) = mcp_config {
             cmd.arg("--mcp-config").arg(mcp);
         }
@@ -398,7 +572,11 @@ impl ChatClient {
     ) -> Result<String> {
         let mut cmd = Command::new("codex");
         cmd.arg("exec").arg("--json").arg("--model").arg(model)
-            .arg("--dangerously-bypass-approvals-and-sandbox");
+            .arg("--dangerously-bypass-approvals-and-sandbox")
+            // Subscription mode uses the ChatGPT/Codex login; a stray
+            // OPENAI_API_KEY in the environment makes codex bill the API key
+            // instead. Strip it so the subscription login is used here.
+            .env_remove("OPENAI_API_KEY");
         if let Some(mcp) = mcp_config {
             for (name, cmdline, args) in mcp_servers_from(mcp) {
                 cmd.arg("-c").arg(format!("mcp_servers.{name}.command={cmdline}"));
@@ -561,11 +739,26 @@ fn mcp_servers_from(path: &str) -> Vec<(String, String, String)> {
 pub fn cli_binary_for(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("claude"),
+        // Z.ai GLM runs through the Claude Code CLI pointed at Z.ai's
+        // Anthropic-compatible endpoint (the Z.ai devpack "cline"/"zcode" setup):
+        // chat_claude_stream injects ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
+        // from ZAI_API_KEY for this provider.
+        "zai" => Some("claude"),
         "openai" => Some("codex"),
         "xai" => Some("grok"),
         "gemini" => Some("gemini"),
+        "opencode" => Some("opencode"),
+        "nous" => Some("hermes"),
         _ => None,
     }
+}
+
+/// Z.ai's Anthropic-compatible base URL for driving GLM through the Claude Code
+/// CLI (Z.ai devpack / cline / zcode). Overridable for self-hosted gateways.
+pub fn zai_anthropic_base_url() -> String {
+    std::env::var("ZAI_ANTHROPIC_BASE_URL")
+        .or_else(|_| std::env::var("ZAI_CODING_BASE_URL"))
+        .unwrap_or_else(|_| "https://api.z.ai/api/anthropic".to_string())
 }
 
 /// Is `name` an executable found on PATH?
@@ -577,7 +770,7 @@ pub fn binary_in_path(name: &str) -> bool {
 
 /// Which subscription CLI backends are installed locally.
 pub fn installed_cli_backends() -> Vec<&'static str> {
-    ["claude", "codex", "grok", "gemini"].into_iter().filter(|b| binary_in_path(b)).collect()
+    ["claude", "codex", "grok", "gemini", "opencode", "hermes"].into_iter().filter(|b| binary_in_path(b)).collect()
 }
 
 /// Login state of a subscription CLI backend.
@@ -596,16 +789,32 @@ pub enum LoginStatus {
 pub async fn cli_login_status(provider: &str) -> LoginStatus {
     let Some(bin) = cli_binary_for(provider) else { return LoginStatus::NotInstalled };
     if !binary_in_path(bin) { return LoginStatus::NotInstalled; }
+    // Z.ai GLM runs through the `claude` binary but authenticates with a Z.ai
+    // key, not the Claude login — so a trivial `claude` probe here would check
+    // the wrong credential. It's usable iff the binary exists and ZAI_API_KEY
+    // is set.
+    if provider == "zai" {
+        let has_key = std::env::var("ZAI_API_KEY").map(|v| !v.trim().is_empty()).unwrap_or(false);
+        return if has_key { LoginStatus::LoggedIn } else { LoginStatus::NotLoggedIn };
+    }
     let mut cmd = Command::new(bin);
+    // opencode/hermes take the probe prompt as an argv value, not stdin.
+    let prompt_via_stdin = !matches!(bin, "opencode" | "hermes");
     match bin {
         "claude" => { cmd.arg("-p").arg("--output-format").arg("text").arg("--dangerously-skip-permissions"); }
         "codex" => { cmd.arg("exec").arg("--dangerously-bypass-approvals-and-sandbox").arg("-"); }
+        "opencode" => { cmd.arg("run").arg("--auto").arg("Reply with exactly: OK"); }
+        "hermes" => { cmd.arg("chat").arg("--provider").arg("nous").arg("-Q").arg("--yolo").arg("-q").arg("Reply with exactly: OK"); }
         _ => { cmd.arg("-p"); } // grok / gemini: prompt on stdin
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return LoginStatus::Unknown };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(b"Reply with exactly: OK").await;
+    if prompt_via_stdin {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"Reply with exactly: OK").await;
+        }
+    } else {
+        drop(child.stdin.take());
     }
     let out = match tokio::time::timeout(Duration::from_secs(45), child.wait_with_output()).await {
         Ok(Ok(o)) => o,
@@ -629,10 +838,50 @@ pub async fn cli_login_status(provider: &str) -> LoginStatus {
 }
 
 /// Does this provider's agentic CLI accept a Playwright MCP config?
-/// Claude Code and Codex do; Gemini/Grok CLIs don't take an MCP-config flag, so
-/// they fall back to their own built-in tools.
+/// Claude Code, Codex, and OpenCode do (OpenCode via a generated
+/// `opencode.json` + `OPENCODE_CONFIG`, see `write_opencode_mcp_config`).
+/// Gemini/Grok/Hermes have no CLI-level MCP hook, so they fall back to their
+/// own built-in tools (Hermes ships web/terminal/computer-use natively).
 pub fn mcp_supported(provider: &str) -> bool {
-    matches!(provider, "anthropic" | "openai")
+    matches!(provider, "anthropic" | "openai" | "opencode")
+}
+
+/// Convert our `.mcp.json` (`{"mcpServers": {name: {command, args}}}`) into
+/// OpenCode's own config schema (`{"mcp": {name: {"type":"local","command":
+/// [command, ...args], "enabled": true}}}`) and write it next to the source
+/// file. OpenCode has no `--mcp-config` flag; it's pointed at a config file
+/// via the `OPENCODE_CONFIG` env var instead (set by the `opencode` arm of
+/// `chat_cli`), so this doesn't touch the user's own `opencode.json`.
+fn write_opencode_mcp_config(mcp_json_path: &str) -> Result<std::path::PathBuf> {
+    let txt = std::fs::read_to_string(mcp_json_path)
+        .map_err(|e| anyhow!("read {mcp_json_path}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&txt)
+        .map_err(|e| anyhow!("parse {mcp_json_path}: {e}"))?;
+    let servers = v.get("mcpServers").cloned().unwrap_or(v);
+    let mut mcp = serde_json::Map::new();
+    if let Some(obj) = servers.as_object() {
+        for (name, s) in obj {
+            let command = s.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            if command.is_empty() { continue; }
+            let mut argv = vec![serde_json::Value::String(command)];
+            if let Some(args) = s.get("args").and_then(|a| a.as_array()) {
+                argv.extend(args.iter().cloned());
+            }
+            mcp.insert(name.clone(), serde_json::json!({
+                "type": "local",
+                "command": argv,
+                "enabled": true
+            }));
+        }
+    }
+    let cfg = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": mcp
+    });
+    let path = std::path::Path::new(mcp_json_path).with_file_name("opencode.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default())
+        .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Best-effort ensure the Playwright MCP server is available locally. Requires
@@ -702,6 +951,116 @@ impl Default for ChatClient {
     }
 }
 
+/// Default output budget for a chat completion, keyed off the model family.
+///
+/// Reasoning models (GLM, DeepSeek, Qwen "thinking", the o-series, …) spend a
+/// large, hidden chunk of their output budget on an internal reasoning stream
+/// *before* the answer. With a 4K cap and a big prompt — e.g. whitebox code
+/// review, which inlines a whole source bundle — they routinely hit
+/// `finish_reason: "length"` with an empty `content`, surfacing as the
+/// "empty content" error. Give those families more headroom; leave the rest at
+/// the cheaper default. Override for all models with `NEUROSPLOIT_MAX_TOKENS`.
+fn max_tokens_for(model: &str) -> u32 {
+    if let Some(v) = std::env::var("NEUROSPLOIT_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
+    {
+        return v;
+    }
+    let m = model.to_ascii_lowercase();
+    // Strip a provider/route prefix like "anthropic/" or "z-ai/" so the family
+    // match works for OpenRouter/LiteLLM-style ids too.
+    let fam = m.rsplit('/').next().unwrap_or(&m);
+    let reasoning = fam.contains("glm")
+        || fam.contains("deepseek")
+        || fam.contains("qwen")
+        || fam.contains("kimi")
+        || fam.contains("reason")
+        || fam.contains("think")
+        || fam.contains("-r1")
+        || fam.contains("-r2")
+        // OpenAI o-series (o1/o3/o4…) and "sol" reasoning variants.
+        || fam.starts_with('o') && fam.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+        || fam.contains("-sol");
+    if reasoning {
+        32768
+    } else {
+        4096
+    }
+}
+
+/// Reassemble assistant text from a Server-Sent Events body — the streaming
+/// chat-completions format (`data: {json}\n\n` frames, ending with
+/// `data: [DONE]`). Some gateways return this even when `stream` wasn't
+/// requested, which makes a whole-body `serde_json::from_str` fail. Each frame's
+/// delta lives at `choices[0].delta.content` (final frames may use `message`
+/// instead). Returns `None` when the body isn't SSE at all.
+fn parse_sse_content(body: &str) -> Option<String> {
+    let mut saw_frame = false;
+    let mut out = String::new();
+    for line in body.lines() {
+        let line = line.trim_start();
+        let Some(payload) = line.strip_prefix("data:") else { continue };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            saw_frame = true;
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+        saw_frame = true;
+        let choice = &v["choices"][0];
+        if let Some(delta) = choice.get("delta") {
+            out.push_str(&extract_message_text(delta));
+        }
+        // Non-streaming frame delivered over SSE (some gateways do this).
+        if choice.get("message").is_some() {
+            out.push_str(&extract_message_text(&choice["message"]));
+        }
+    }
+    if saw_frame {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Pull the assistant text out of an OpenAI-compatible `message`, tolerating the
+/// three response shapes seen across providers:
+///   1. `content` is a plain string (classic OpenAI).
+///   2. `content` is an array of parts `[{"type":"text","text":"…"}, …]`
+///      (some proxies and Z.ai/GLM in certain modes).
+///   3. `content` is null but the text lives in `reasoning_content`
+///      (reasoning models like GLM / DeepSeek, often when cut off early).
+/// Returns an empty string when none carries usable text, so the caller can
+/// report a precise, diagnosable error instead of a bare "no content".
+fn extract_message_text(msg: &serde_json::Value) -> String {
+    if let Some(s) = msg["content"].as_str() {
+        if !s.trim().is_empty() {
+            return s.to_string();
+        }
+    }
+    if let Some(arr) = msg["content"].as_array() {
+        let joined: String = arr
+            .iter()
+            .filter_map(|part| part["text"].as_str().or_else(|| part.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        if !joined.trim().is_empty() {
+            return joined;
+        }
+    }
+    // Last resort: a reasoning model that never finalized an answer. The chain
+    // of thought often still contains the JSON we want, and downstream
+    // extraction is robust to surrounding prose.
+    if let Some(s) = msg["reasoning_content"].as_str() {
+        if !s.trim().is_empty() {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
 fn truncate(s: &str, n: usize) -> String {
     // Truncate by CHARACTERS, never bytes — slicing `&s[..n]` panics when `n`
     // lands inside a multi-byte char (e.g. '—'). That panic was crashing agent
@@ -710,5 +1069,83 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn zai_glm_catalog_and_cli_backend() {
+        // GLM must be offered in all requested versions and be drivable through
+        // the Claude Code CLI (Z.ai devpack / cline / zcode).
+        let z = providers().into_iter().find(|p| p.key == "zai").expect("zai provider");
+        for m in ["glm-5.1", "glm-5.2", "glm-5.3"] {
+            assert!(z.models.contains(&m), "GLM {m} missing from catalog: {:?}", z.models);
+        }
+        assert_eq!(cli_binary_for("zai"), Some("claude"), "GLM runs via the claude CLI");
+        // GLM is reasoning-heavy → gets the larger token ceiling.
+        assert_eq!(max_tokens_for("glm-5.3"), 32768);
+    }
+
+    #[test]
+    fn anthropic_catalog_lists_opus_4_6() {
+        // Regression: the web console offers claude-opus-4-6, so the harness
+        // catalog must list it too — otherwise the model id is "corrected" to a
+        // sibling and the requested model never runs.
+        let a = providers().into_iter().find(|p| p.key == "anthropic").expect("anthropic provider");
+        assert!(a.models.contains(&"claude-opus-4-6"), "catalog: {:?}", a.models);
+    }
+
+    #[test]
+    fn reasoning_models_get_more_headroom() {
+        for m in ["glm-5.3", "glm-4.6", "deepseek-v4.1", "z-ai/glm-5.3", "qwen3.8-max", "kimi-k3", "o3", "gpt-6-sol"] {
+            assert_eq!(max_tokens_for(m), 32768, "{m} should be treated as reasoning-heavy");
+        }
+    }
+
+    #[test]
+    fn plain_models_keep_default() {
+        for m in ["gpt-5.5", "claude-opus-5-5", "anthropic/claude-opus-4-8", "gemini-3-pro", "grok-4.7", "meta-llama/llama-3.3-70b-instruct"] {
+            assert_eq!(max_tokens_for(m), 4096, "{m} should keep the default cap");
+        }
+    }
+
+    #[test]
+    fn extracts_plain_string_content() {
+        let msg = json!({"content": "hello"});
+        assert_eq!(extract_message_text(&msg), "hello");
+    }
+
+    #[test]
+    fn extracts_array_content_parts() {
+        let msg = json!({"content": [{"type": "text", "text": "foo"}, {"type": "text", "text": "bar"}]});
+        assert_eq!(extract_message_text(&msg), "foobar");
+    }
+
+    #[test]
+    fn falls_back_to_reasoning_content() {
+        let msg = json!({"content": serde_json::Value::Null, "reasoning_content": "the answer"});
+        assert_eq!(extract_message_text(&msg), "the answer");
+    }
+
+    #[test]
+    fn reassembles_sse_stream() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"foo\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"bar\"}}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(parse_sse_content(body).as_deref(), Some("foobar"));
+    }
+
+    #[test]
+    fn non_sse_body_returns_none() {
+        assert!(parse_sse_content("{\"choices\":[]}").is_none());
+        assert!(parse_sse_content("plain text").is_none());
+    }
+
+    #[test]
+    fn empty_everywhere_yields_empty() {
+        let msg = json!({"content": "   "});
+        assert!(extract_message_text(&msg).trim().is_empty());
     }
 }

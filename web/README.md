@@ -1,0 +1,64 @@
+# NeuroSploit v4.2.0 — web console
+
+A browser UI for the `neurosploit` CLI harness: a 5-step engagement wizard (Asset → Scope & Auth
+→ Leads → Model & Run → Review), a live structured findings view with a generative attack-path
+graph, run history, an Auth & Keys menu, and a real terminal — all driven by spawning the actual
+CLI binary, never a reimplementation of harness logic.
+
+- **Asset** — pick black/white/grey-box, host/infra, or AI/LLM, set the target or repo.
+- **Scope & Auth** — objective, focus, out-of-scope, and a link into the Auth & Keys menu.
+- **Leads** — the categorized agent picker (435 agents auto-classified) + custom leads.
+- **Model & Run** — pick a provider/model from the live catalog, API-key vs. subscription auth
+  mode, votes/chain-depth/recon intensity.
+- **Review** — confirm the plan, then `Start Exploitation` spawns the real CLI.
+- **Auth & Keys** (one menu, 🔑 in the sidebar) — target auth header + named roles for
+  IDOR/BOLA/BFLA testing, per-provider API keys (kept in server memory only, never on disk), and
+  an explicit `creds.yaml` path override.
+- **Attack graph** — the run's graph memory (web + internal network): host → service → finding →
+  credential → impact, every edge marked confirmed / needs validation / hypothesis, findings ordered
+  by kill-chain stage. Refreshed live at each graph checkpoint; click a finding to open it. Chains
+  and Dependencies list the same paths as text and as the step-by-step todolist.
+- **Wire evidence in the finding** — the finding modal shows the real request/response pairs the
+  harness measured (baseline vs. attack, the identity pair, matrix probes, the oracle), each tagged
+  with its wire provenance, plus the finding's wire-check summary and any recorded flow on the same
+  endpoint. The proof as bytes, not as the agent's prose.
+- **Per-finding re-test with history** — ⟳ Re-test re-runs one finding's recorded proof through the
+  scope-guarded replay engine and keeps a dated history (reproduced / changed / gone / unverifiable),
+  so a finding drifting to "gone" over time is visible. Nothing is written back to the findings.
+- **Transcript viewer** — the Traces tab renders a chosen agent's transcript split into navigable,
+  collapsible blocks at each tool-call / HTTP-request boundary; search still spans every agent.
+- **Terminal dock (xterm.js)** — `❭_` in the sidebar, the topbar button, or `Ctrl+\`` opens a
+  docked terminal running a real `neurosploit` REPL session. Its stdout is streamed **unstripped**,
+  so the harness's own colour and box-drawn panels render as they do in a local shell. Line
+  editing (echo, ←/→, history, `Tab` slash-command completion, `Ctrl+C`/`L`/`U`/`A`/`E`) is local
+  because the child is spawned over a pipe, not a PTY, and therefore never echoes. The target
+  picker in its header switches between a standalone session and the **running engagement**, so
+  mid-run instructions go to the same process that is doing the testing.
+- **Real REPL underneath run/whitebox/greybox** — the wizard scripts an actual interactive
+  `neurosploit` session instead of a one-shot CLI call, so it keeps reading stdin while the
+  engagement streams. The Activity log tab grows a `❭` prompt box to send `/status`, `/stop`,
+  `/continue`, or a plain-language instruction mid-run. `host`/`aitest`/`skills` stay one-shot
+  (their onboarding scope picker can't be scripted over piped stdin).
+
+```bash
+cd neurosploit-rs && cargo build --release   # build the CLI once
+node web/server.js                            # → http://localhost:4173
+```
+
+Zero npm dependencies (Node ≥18, built-ins only: `http`, `child_process`, `events`, `fs`).
+
+API reference: [`API.md`](./API.md).
+
+## Layout
+
+```
+web/
+├── server.js         backend: static server + agents_md/runs reader + CLI process manager
+├── public/
+│   ├── index.html     SPA shell
+│   ├── style.css       lead-board / live-run / terminal-dock styling
+│   ├── app.js          client logic (fetch + EventSource + terminal, no framework)
+│   └── vendor/         xterm.js + fit addon (vendored; nothing is fetched at runtime)
+├── API.md
+└── package.json
+```
